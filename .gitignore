@@ -1,0 +1,20 @@
+# Data and run outputs live under DATA_ROOT (default ~/splat_data), never in git
+data/
+runs/
+*.db
+*.ply
+*.bin
+*.parquet
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
