@@ -1,5 +1,7 @@
-# Data and run outputs live under DATA_ROOT (default ~/splat_data), never in git
+# Data and run outputs, now kept in-repo under data/ but never committed
 data/
+# Photo originals: the one irreplaceable input, never committed (see PLAN.md)
+photos/
 runs/
 *.db
 *.ply
@@ -18,4 +20,3 @@ venv/
 .vscode/
 .idea/
 .DS_Store
-*.jpeg

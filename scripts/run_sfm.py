@@ -54,6 +54,10 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--max-image-size", type=int, default=3200,
                    help="Downscale above this before feature extraction.")
     p.add_argument("--max-num-features", type=int, default=8192)
+    p.add_argument("--num-threads", type=int, default=4,
+                   help="Threads for feature extraction and matching. Without a CUDA "
+                        "build of COLMAP these run on the CPU at roughly 2 GB of RAM "
+                        "each, so raise this only if you have the memory to spare.")
     p.add_argument("--downscales", type=int, nargs="*", default=list(DEFAULT_DOWNSCALES),
                    help="Make images_<N>/ PNG copies. gsplat needs these for --factor N.")
     p.add_argument("--keep-exif-orientation", action="store_true",
@@ -78,6 +82,7 @@ def main(argv=None) -> int:
         use_gpu=not args.no_gpu,
         max_image_size=args.max_image_size,
         max_num_features=args.max_num_features,
+        num_threads=args.num_threads,
         downscales=tuple(args.downscales),
         normalize_orientation=not args.keep_exif_orientation,
         undistort=args.undistort,

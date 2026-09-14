@@ -288,6 +288,7 @@ class SfmConfig:
     use_gpu: bool = True
     max_image_size: int = 3200
     max_num_features: int = 8192
+    num_threads: int = 4
     downscales: Tuple[int, ...] = DEFAULT_DOWNSCALES
     normalize_orientation: bool = True
     undistort: bool = False
@@ -346,8 +347,23 @@ def run_sfm(cfg: SfmConfig, log: Callable[[str], None] = print) -> Dict[str, Any
     import pycolmap  # imported late so --dry-run and tests work without it
 
     report["pycolmap_version"] = pycolmap.__version__
+    report["pycolmap_has_cuda"] = bool(getattr(pycolmap, "has_cuda", False))
     paths.out.mkdir(parents=True, exist_ok=True)
     device = pycolmap.Device.auto if cfg.use_gpu else pycolmap.Device.cpu
+
+    if cfg.use_gpu and not report["pycolmap_has_cuda"]:
+        # The PyPI wheel ships without CUDA, so use_gpu silently falls back to
+        # CPU SIFT. That path costs ~2 GB of RAM per thread on 12 MP photos, so
+        # an uncapped num_threads will OOM the machine (and, from the VS Code
+        # terminal, take the editor down with it: DefaultOOMPolicy=stop kills
+        # the whole app scope). Hence the modest num_threads default.
+        report["warnings"].append(
+            f"pycolmap {pycolmap.__version__} was built without CUDA, so the GPU cannot "
+            f"be used: features and matches run on the CPU with {cfg.num_threads} threads "
+            "(~2 GB RAM each; --num-threads to change). For GPU SIFT you need a "
+            "CUDA-enabled COLMAP build."
+        )
+        log(f"NOTE: {report['warnings'][-1]}")
 
     t0 = time.time()
     copied, rotated = prepare_images(
@@ -363,6 +379,7 @@ def run_sfm(cfg: SfmConfig, log: Callable[[str], None] = print) -> Dict[str, Any
     extraction_options.use_gpu = cfg.use_gpu
     extraction_options.max_image_size = cfg.max_image_size
     extraction_options.sift.max_num_features = cfg.max_num_features
+    extraction_options.num_threads = cfg.num_threads
     camera_mode = (
         pycolmap.CameraMode.SINGLE if cfg.single_camera else pycolmap.CameraMode.AUTO
     )
@@ -383,6 +400,7 @@ def run_sfm(cfg: SfmConfig, log: Callable[[str], None] = print) -> Dict[str, Any
     t0 = time.time()
     matching_options = pycolmap.FeatureMatchingOptions()
     matching_options.use_gpu = cfg.use_gpu
+    matching_options.num_threads = cfg.num_threads
     if cfg.matcher == "sequential":
         pycolmap.match_sequential(
             database_path=paths.database, matching_options=matching_options, device=device
