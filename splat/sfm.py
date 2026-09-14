@@ -176,10 +176,19 @@ def prepare_images(
                 upright = ImageOps.exif_transpose(im)
                 if upright.mode not in ("RGB", "L"):
                     upright = upright.convert("RGB")
+                # exif_transpose returns a NEW image: its .format is None and its
+                # EXIF is not carried into save() automatically. Both matter.
+                #   - subsampling="keep" requires a JPEG source, so it raises here.
+                #     4:4:4 keeps the full chroma the "keep" was protecting.
+                #   - COLMAP seeds intrinsics from EXIF focal length (falling back
+                #     to a ~1.8x-off guess of 1.2 * max(w, h) without it), so the
+                #     tags must be written through, upright now that pixels are.
+                exif = upright.getexif()
+                exif[EXIF_ORIENTATION_TAG] = 1
+                save_kwargs: Dict[str, Any] = {"exif": exif.tobytes()}
                 if dst.suffix.lower() in (".jpg", ".jpeg"):
-                    upright.save(dst, quality=jpeg_quality, subsampling="keep")
-                else:
-                    upright.save(dst)
+                    save_kwargs.update(quality=jpeg_quality, subsampling=0)
+                upright.save(dst, **save_kwargs)
             rotated += 1
         else:
             shutil.copy2(src, dst)

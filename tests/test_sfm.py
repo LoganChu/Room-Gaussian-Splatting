@@ -15,6 +15,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from splat.sfm import (  # noqa: E402
+    EXIF_ORIENTATION_TAG,
     SfmConfig,
     downscale_images,
     evaluate_quality,
@@ -30,10 +31,25 @@ PIL = pytest.importorskip("PIL", reason="Pillow needed for image tests")
 from PIL import Image  # noqa: E402
 
 
-def make_image(path: Path, size=(64, 48), color=(120, 40, 200)) -> Path:
+# EXIF tags COLMAP reads to seed camera intrinsics.
+FOCAL_LENGTH_35MM_TAG = 0xA405
+MAKE_TAG = 0x010F
+
+
+def make_image(path: Path, size=(64, 48), color=(120, 40, 200), exif=None) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
-    Image.new("RGB", size, color).save(path)
+    im = Image.new("RGB", size, color)
+    im.save(path, **({"exif": exif.tobytes()} if exif is not None else {}))
     return path
+
+
+def phone_exif(orientation: int) -> "Image.Exif":
+    """EXIF as a phone writes it: orientation plus the tags COLMAP reads."""
+    exif = Image.Exif()
+    exif[EXIF_ORIENTATION_TAG] = orientation
+    exif[FOCAL_LENGTH_35MM_TAG] = 24
+    exif[MAKE_TAG] = "Apple"
+    return exif
 
 
 @pytest.fixture
@@ -107,6 +123,44 @@ class TestPrepareImages:
         make_image(photos / "sub" / "d.jpg")
         prepare_images(list_images(photos), tmp_path / "images", photos)
         assert (tmp_path / "images" / "sub" / "d.jpg").exists()
+
+    # The orientation != 1 branch. Phone photos shot in portrait land here, so it
+    # runs for most real captures even though the fixtures above never reach it.
+    @pytest.mark.parametrize("name", ["portrait.jpg", "portrait.png"])
+    def test_rotated_photo_is_uprighted(self, tmp_path: Path, name: str):
+        src_root = tmp_path / "src"
+        src = make_image(src_root / name, size=(64, 48), exif=phone_exif(6))
+
+        copied, rotated = prepare_images([src], tmp_path / "images", src_root)
+
+        assert (copied, rotated) == (1, 1)
+        with Image.open(tmp_path / "images" / name) as out:
+            assert out.size == (48, 64), "orientation 6 must transpose the pixels"
+            assert out.getexif().get(EXIF_ORIENTATION_TAG) in (None, 1), (
+                "orientation must be cleared, or viewers rotate the pixels twice"
+            )
+
+    def test_rotated_photo_keeps_focal_length_exif(self, tmp_path: Path):
+        """COLMAP seeds intrinsics from EXIF; without it the initial focal length
+        falls back to 1.2 * max(w, h), which is ~1.8x off for a phone camera."""
+        src_root = tmp_path / "src"
+        src = make_image(src_root / "portrait.jpg", exif=phone_exif(6))
+
+        prepare_images([src], tmp_path / "images", src_root)
+
+        with Image.open(tmp_path / "images" / "portrait.jpg") as out:
+            exif = out.getexif()
+        assert exif.get(FOCAL_LENGTH_35MM_TAG) == 24
+        assert exif.get(MAKE_TAG) == "Apple"
+
+    def test_upright_photo_is_copied_byte_for_byte(self, tmp_path: Path):
+        src_root = tmp_path / "src"
+        src = make_image(src_root / "landscape.jpg", exif=phone_exif(1))
+
+        copied, rotated = prepare_images([src], tmp_path / "images", src_root)
+
+        assert (copied, rotated) == (1, 0), "no needless re-encode"
+        assert (tmp_path / "images" / "landscape.jpg").read_bytes() == src.read_bytes()
 
 
 class TestDownscaleImages:
