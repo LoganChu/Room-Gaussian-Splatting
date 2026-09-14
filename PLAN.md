@@ -2,8 +2,11 @@
 
 ## Context
 
-The repo is empty apart from a README. The goal is to **see, step by step, how 3D Gaussian Splatting
-(3DGS) works** while reconstructing your room from **30–100 phone photos**:
+**Status: Phase 2 (capture + SfM) is done. Phase 0b (toolchain) is next and is the only thing standing
+between here and a first training run.** See "Phase status" below.
+
+The goal is to **see, step by step, how 3D Gaussian Splatting (3DGS) works** while reconstructing your room
+from **30–100 phone photos**:
 
 1. start from the COLMAP SfM point cloud,
 2. watch Gaussians clone, split and prune during optimization,
@@ -18,15 +21,22 @@ Decisions made:
   goal. Understanding comes from watching every iteration and reading gsplat's densification code, which is
   plain Python.
 - **COLMAP (pycolmap) for camera poses.**
-- **Platform: native Linux, Ubuntu 24.04 LTS.**
-  - **Primary machine:** the **RTX 5090 desktop (32 GB)**, dual-booted.
-  - **Laptop:** the RTX 5070 Laptop (8 GB) is only an early phase. It runs the same Ubuntu setup script in
-    its existing WSL2 Ubuntu (GPU passthrough verified; miniconda present; no CUDA toolkit yet) or natively.
-  - **Same GPU architecture:** both GPUs are sm_120.
-  - **Repo and data move:** the repo moves out of OneDrive to a git remote, cloned into `~/code/`. Data
-    lives in `DATA_ROOT` (default `~/splat_data`), never in git.
+- **Platform: native Linux, Ubuntu 24.04.5 LTS — this is now the working machine.**
+  - **Machine:** the **RTX 5090 desktop (32 GB)**, booted into Ubuntu. Driver **595.84**, CUDA **13.2**,
+    compute capability **sm_120** (`TORCH_CUDA_ARCH_LIST=12.0`).
+  - **Laptop (RTX 5070, 8 GB):** no longer on the critical path. The WSL2 phase is over — everything is
+    built natively here. The `laptop_5070_8gb` hardware profile stays, because a low-VRAM profile is still
+    the fastest way to iterate and a useful ablation, but it is not a required target.
+  - **Repo:** `~/Projects/Room-Gaussian-Splatting`, on a native ext4 filesystem, out of OneDrive.
+  - **Data:** in the repo at **`data/scenes/<scene>/`**, excluded by `.gitignore`. A scene is then found by
+    relative path from anywhere in the repo, with no environment variable to set. `DATA_ROOT` still
+    overrides the parent directory for a scene that outgrows this disk.
+  - **Python environment: `uv`**, not conda. The repo already carries `pyproject.toml` + `uv.lock` and a
+    `.venv/`; `uv` is installed and conda is not. The lockfile replaces `environment.yml` as the
+    reproducibility artifact.
 
-Verified facts about gsplat (current `main`):
+Verified facts about gsplat — **re-checked 2026-09-14 against `main` @ `28e794ca` (version 1.6.0)**, all
+still true:
 - **Densification defaults** in `DefaultStrategy`:
   - `refine_start_iter=500` and `refine_stop_iter=15_000`, refining every 100 iterations;
   - `grow_grad2d=2e-4`, `grow_scale3d=0.01`, `prune_opa=0.005`;
@@ -39,10 +49,16 @@ Verified facts about gsplat (current `main`):
   - split children (2 per parent) are appended at the end and their parents removed.
 - **No op adds Gaussians from given values.** `sample_add` only samples existing ones, but
   `_update_param_with_optimizer` is the reusable helper for writing one.
-- **Example dependencies:** `examples/requirements.txt` uses official `pycolmap>=3.10` and `fused-ssim`
-  from git, which is a second CUDA extension to build.
+- **Example dependencies:** `examples/requirements.txt` uses the **official** `pycolmap>=3.10.0`
+  (`import pycolmap`), confirmed — not rmbrualla's same-named `SceneManager` fork, so there is **no package
+  name collision** with the `pycolmap 4.2.0` that `run_sfm.py` uses. One environment serves both. It also
+  pins **`torch==2.9.1` / `torchvision==0.24.1`** (not 2.14), and pulls three more git/extension deps
+  besides `fused-ssim`: `fused-bilagrid`, `ppisp` (`nv-tlabs/ppisp@v1.2.1`) and `nvidia-ncore>=19.0.0`.
 - **Builds:** there are no prebuilt gsplat wheels for sm_120, so gsplat builds from source. CUDA 13 support
-  landed on `main` (v1.6.0) after the last PyPI release (1.5.3).
+  is on `main` (version string 1.6.0); the newest **tag and PyPI release is still 1.5.3**, so the pin must
+  be a `main` commit, not a tag.
+- **`torch==2.9.1+cu130` wheels exist** for cp312 linux_x86_64 on `download.pytorch.org/whl/cu130`
+  (cu128 and cu129 also have 2.9.1; plain PyPI does not).
 
 ---
 
@@ -60,8 +76,12 @@ photos ─► run_sfm.py (pycolmap) ─► COLMAP model ─► gsplat simple_tra
 ```
 third_party/gsplat_examples/   # gsplat examples/ copied at the SAME pinned commit as the gsplat package;
                                # our edits marked `# [splat]` and exported to patches/gsplat_examples.patch
+data/                          # gitignored; NOT a package
+  scenes/<scene>/              # run_sfm.py output: images/ images_2|4|8/ sparse/0/ database.db
+  runs/<run>/                  # training outputs: snapshots, events, config, PLY
 splat/
-  paths.py        # DATA_ROOT + run-dir layout
+  sfm.py          # DONE — COLMAP SfM (Phase 2)
+  paths.py        # repo data/ root (DATA_ROOT override) + run-dir layout
   lineage.py      # InstrumentedStrategy(DefaultStrategy) — see below
   append.py       # append_gaussians(): seed injection built on ops._update_param_with_optimizer
   curriculum.py   # image order, active-image sampler, stage schedule, before/after renders
@@ -70,9 +90,10 @@ splat/
   viewer.py       # playback viewer, built from gsplat examples/simple_viewer.py
   report.py       # plots
 configs/  train/{default,incremental}.yaml · hardware/{desktop_5090_32gb,laptop_5070_8gb}.yaml
-scripts/  setup_env.sh · run_sfm.py · train.py · view.py · report.py
+scripts/  setup_env.sh · run_sfm.py (DONE) · viz_sfm.py (DONE) · verify_gsplat_compat.py (DONE)
+          train.py · view.py · report.py
 docs/     how_it_works.md   # annotated reading guide to gsplat/strategy/default.py, tied to viewer screens
-tests/    test_lineage · test_append · test_curriculum · test_snapshots
+tests/    test_sfm (DONE, 30 tests) · test_lineage · test_append · test_curriculum · test_snapshots
 ```
 
 ### The four hooks into the vendored trainer (small, marked edits)
@@ -144,27 +165,39 @@ so runs `rsync` between machines.
 
 ## Phases
 
-**Phase 0a — Machine setup (per machine, not portable)**
-- **On the laptop's WSL2:** nothing to do. The GPU is already visible there and the Windows driver serves
-  it. Never install a Linux NVIDIA driver inside WSL.
-- **On the 5090 desktop:** back up the BitLocker recovery key, disable Windows Fast Startup, install
-  Ubuntu 24.04, and enroll the MOK if Secure Boot stays on. Install **`nvidia-open`**, r580 or newer;
-  Blackwell requires the open kernel modules and CUDA 13 needs r580+.
+**Phase 0a — Machine setup — ✅ DONE**
+- Ubuntu 24.04.5 LTS is installed and booted on the 5090 desktop.
+- Driver **595.84** is loaded and `nvidia-smi` reports the RTX 5090 with 32 GB and CUDA 13.2. This is
+  r580+, as Blackwell requires, so the driver step is finished. Nothing further to do here.
 
-**Phase 0b — Toolchain (same steps on WSL2 and native Ubuntu)**
-- **CUDA toolkit:** install CUDA 13.x from NVIDIA's apt repo. Only the repo variant differs: `wsl-ubuntu`
-  under WSL2, `ubuntu2404` on the desktop.
-- **`scripts/setup_env.sh`** detects WSL2 (`grep -qi microsoft /proc/version`) to pick that repo and skip
-  the driver step. It runs once per machine, because compiled extensions don't transfer, but the commands
-  and the `TORCH_CUDA_ARCH_LIST=12.0` target are identical. It:
-  - creates the conda env `splat` (Python 3.11, torch 2.14.0+cu130);
-  - builds gsplat from a **pinned commit** (v1.6.0 tag if released, else a `main` commit with CUDA 13
-    support) with `TORCH_CUDA_ARCH_LIST=12.0`;
-  - installs `examples/requirements.txt`, including building fused-ssim;
-  - vendors `examples/` from the same commit;
-  - writes `environment.yml`.
-- **Check:** `nvidia-smi` works, `torch.cuda.get_device_capability() == (12, 0)`, and a 7k-iteration
+**Phase 0b — Toolchain — ⬅️ NEXT, and the only blocker for training**
+
+Nothing of the training stack exists on this machine yet: **no `gcc`/`g++`, no `nvcc`, no CUDA toolkit, no
+torch, no gsplat.** The only Python environment is the uv `.venv`, holding pillow + pycolmap + pytest, which
+is what `run_sfm.py` needs and nothing more.
+
+- **System packages (apt):** `build-essential` (gcc/g++ 13, the 24.04 default and a supported host compiler
+  for CUDA 13) and `ninja-build`. Without a compiler nothing below can build.
+- **CUDA toolkit:** CUDA 13.x from NVIDIA's apt repo, `ubuntu2404` variant. **Do not install a driver from
+  it** — 595.84 is already newer than whatever the toolkit meta-package would pull; install the toolkit
+  component only (`cuda-toolkit-13-x`, not `cuda`). Then `export CUDA_HOME=/usr/local/cuda`.
+- **`scripts/setup_env.sh`** — native Ubuntu only now; the WSL2 detection branch is dropped. It:
+  - creates the env with **uv** (`uv venv --python 3.12`), not conda;
+  - installs **`torch==2.9.1` + `torchvision==0.24.1` from the cu130 index**
+    (`--index-url https://download.pytorch.org/whl/cu130`) — the version gsplat's
+    `examples/requirements.txt` pins, and the one CUDA 13 wheel that exists for cp312/linux;
+  - builds gsplat from a **pinned `main` commit** (1.6.0 is unreleased, so a commit hash, not a tag) with
+    `TORCH_CUDA_ARCH_LIST=12.0`;
+  - installs `examples/requirements.txt`, which also builds **fused-ssim**, **fused-bilagrid** and
+    **ppisp** — four CUDA extensions total, so budget real time for this step and set
+    `MAX_JOBS` to keep the compile from exhausting RAM;
+  - vendors `examples/` from the same commit into `third_party/gsplat_examples/`;
+  - updates `uv.lock` (which replaces `environment.yml`).
+- **Check:** `torch.cuda.get_device_capability() == (12, 0)`, `import gsplat` succeeds, and a 7k-iteration
   `simple_trainer` run on Mip-NeRF 360 "room" opens the live viewer.
+- **Note:** the two CUDA-version numbers differ on purpose. The driver reports 13.2 (what it can run);
+  torch is built against cu130 (what it was compiled with). A driver newer than the toolkit is the correct
+  direction, so this is fine.
 
 **Phase 1 — Baseline and read-through**
 - **Baseline run:** train Mip-NeRF 360 "room" to 30k iterations with vanilla simple_trainer, and record
@@ -172,15 +205,30 @@ so runs `rsync` between machines.
 - **Reading guide:** write `docs/how_it_works.md` alongside reading `gsplat/strategy/default.py` and the
   training loop.
 
-**Phase 2 — Your data**
-- **Capture protocol:**
-  - lock exposure, focus and white balance; no zoom; avoid motion blur;
-  - shoot from 3–4 positions at 2 heights with about 70% overlap;
-  - keep texture in every frame; don't move objects.
-- **`run_sfm.py`:** pycolmap SIFT → exhaustive matching → incremental mapping → undistort, written in the
-  layout `simple_trainer` expects.
-- **Check:** at least 90% of images registered, mean reprojection error under about 1 px, and the point
-  cloud plus frustums look right in viser.
+**Phase 2 — Your data — ✅ DONE (`data/scenes/room-1/`)**
+- **Capture protocol** (as followed): lock exposure, focus and white balance; no zoom; avoid motion blur;
+  shoot from 3–4 positions at 2 heights with about 70% overlap; keep texture in every frame; don't move
+  objects.
+- **`run_sfm.py`:** pycolmap 4.2.0 SIFT → exhaustive matching → incremental mapping, written in the layout
+  `simple_trainer` expects. Undistortion is skipped on purpose: gsplat's Parser undistorts OPENCV cameras
+  itself, so a second copy of the images would be dead weight.
+- **Result — every gate met:**
+
+  | Check | Gate | Actual |
+  |---|---|---|
+  | Registered images | ≥ 90% | **32 / 32 (100%)** |
+  | Mean reprojection error | ≲ 1 px | **0.93 px** |
+  | Models reconstructed | 1 | **1** (no fragmentation) |
+  | Camera | single | **1 × OPENCV, 3024×4032** |
+
+  6,762 points3D · 24,222 observations · mean track length 3.58 · 757 observations per image.
+- **Two soft spots, neither blocking.** 6.7k points with a mean track length of 3.58 is a **thin seed** for
+  a room, so densification will be doing nearly all the work and Phase 5's seed-point injection has less to
+  draw on. And 32 photos is the bottom of the 30–100 target. If quality disappoints, **more photos is the
+  first lever**, before any hyperparameter.
+- **SfM ran on CPU.** The installed pycolmap 4.2.0 wheel is built without CUDA, so feature extraction and
+  matching used 8 CPU threads (recorded as a warning in `sfm_report.json`). It cost ~6 s of mapping at this
+  scale, so it is not worth chasing a CUDA COLMAP build unless the photo count grows a lot.
 
 **Phase 3 — Instrumentation**
 - **What to add:** `lineage.py`, `events.py`, `snapshots.py`, hooks 1 and 4, and `report.py` (Gaussian count
@@ -202,40 +250,37 @@ so runs `rsync` between machines.
 - **Train:** run the full-resolution incremental run followed by a standard 30k run.
 - **Output:** export the PLY (viewable in SuperSplat) and do the browser walkthrough.
 
-### What runs where
+### Phase status
 
-WSL2 Ubuntu and native Ubuntu run the same userland, so **everything except Phase 0a and Phase 6 can be
-built today in the laptop's WSL2** and carries over unchanged.
+Everything now runs on one machine: the native Ubuntu 5090 desktop. The WSL2 / Windows split is history.
 
-| Phase | Start now in WSL2? | Notes |
+| Phase | Status | Notes |
 |---|---|---|
-| 0a machine setup | no | WSL2 needs nothing; the desktop needs it once |
-| 0b toolchain | yes | same script; rerun once on the desktop |
-| 1 baseline + reading guide | yes | use `--hw laptop_5070_8gb` (`data_factor 4`, fewer iterations) |
-| 2 capture + SfM | yes | **do this early** — it needs your physical room, and the COLMAP model is reused as-is on the desktop |
-| 3 instrumentation | yes | pure Python; tests are tiny and synthetic |
-| 4 playback viewer | yes | viser serves `localhost:8080`; open it in the Windows browser |
-| 5 curriculum | yes | develop at low resolution and few images |
-| 6 full-quality room run | no | the only phase gated on the 5090 |
+| 0a machine setup | ✅ done | Ubuntu 24.04.5, driver 595.84, CUDA 13.2, sm_120 |
+| 0b toolchain | ⬅️ **next — blocks everything** | no compiler, no CUDA toolkit, no torch, no gsplat yet |
+| 1 baseline + reading guide | todo | needs 0b; Mip-NeRF 360 "room" at 30k as the reference |
+| 2 capture + SfM | ✅ done | `data/scenes/room-1/`, 32/32 registered, 0.93 px |
+| 3 instrumentation | todo | pure Python once gsplat imports; tests tiny and synthetic |
+| 4 playback viewer | todo | viser on `localhost:8080`, opened locally |
+| 5 curriculum | todo | develop at `--data_factor 8`, few images, then scale up |
+| 6 full-quality room run | todo | `--data_factor 1` or 2; the payoff |
 
-**Immediate plan (before the Linux switch):** Phase 0b is **deferred** — the toolchain gets built once, on
-the native Linux desktop, rather than twice. Two things are written on Windows now and carried over by git:
+**Immediate plan:**
 
-1. **`PLAN.md` at the repo root** — this plan, committed so it can be pulled onto the Linux machine.
-2. **`scripts/run_sfm.py`** (Phase 2) — the photo directory is a runtime argument, so this needs neither the
-   photos nor a GPU to be written. It cannot be *run* until the Linux env exists, so it ships with a
-   `--dry-run` mode that validates paths, config and the output layout, plus unit tests for the pure-Python
-   parts that import without pycolmap. Its first real run is on Linux, on your photos.
+1. **Phase 0b** — write and run `scripts/setup_env.sh`. This is the whole blocker.
+2. **Phase 1** — vanilla `simple_trainer` on Mip-NeRF 360 "room" for the baseline, *and* a first vanilla run
+   on `data/scenes/room-1` at `--data_factor 4` just to see the room appear. That first room render is the
+   cheapest possible check that Phase 2's output is genuinely trainable end to end.
+3. **Phases 3 → 4 → 5 → 6** in order.
 
-Then on the desktop: Phase 0a → `setup_env.sh` (0b) → Phase 2 for real → Phases 1, 3, 4, 5 → 6.
-
-**To keep the work transferable:**
-- **Repo:** in WSL's own filesystem (`~/code/...`), never `/mnt/c`, and synced through a git remote.
-- **Photo originals:** keep a copy outside WSL, since they are the one irreplaceable input.
-- **Data:** `DATA_ROOT=~/splat_data`, moved to the desktop with `rsync`.
-- **Environment:** reproduced from pinned `environment.yml`, not copied.
+**Reproducibility (one machine, but still worth keeping):**
+- **Repo:** `~/Projects/Room-Gaussian-Splatting` on ext4, synced through a git remote.
+- **Photo originals:** `photos/` is gitignored — keep a copy on separate media. They are the one
+  irreplaceable input; the SfM model can always be rebuilt from them, but nothing rebuilds them.
+- **Data:** `data/scenes/` and `data/runs/`, gitignored, alongside the code.
+- **Environment:** reproduced from `uv.lock` + `setup_env.sh`, not copied. Compiled CUDA extensions never
+  transfer between machines; the script is what makes them reproducible.
 - **Paths and budgets:** only through `paths.py` and `--hw auto`, with nothing machine-specific hardcoded.
-- **WSL memory:** raise the default cap (50% of RAM, about 15.6 GB here) in `.wslconfig` for COLMAP matching.
 
 ---
 
@@ -243,12 +288,16 @@ Then on the desktop: Phase 0a → `setup_env.sh` (0b) → Phase 2 for real → P
 
 | Risk | Mitigation |
 |---|---|
-| Blackwell driver problems on Linux | `nvidia-open` r580+; MOK enrollment; Windows stays as fallback boot |
-| gsplat / fused-ssim build fails | gcc 13 (24.04 default); CUDA toolkit major = torch's cu130; `TORCH_CUDA_ARCH_LIST=12.0`; if fused-ssim fails, swap to torchmetrics SSIM in one `# [splat]` edit |
-| Hooks rely on gsplat internals (`_grow_gs`, `_prune_gs`, ops helper) | pinned commit; tests fail loudly on upgrade; vendored examples patch kept small |
+| ~~Blackwell driver problems on Linux~~ | **resolved** — 595.84 loaded, 5090 visible, CUDA 13.2 |
+| ~~gsplat's COLMAP parser can't read a pycolmap 4.2 model~~ | **resolved** — verified 2026-09-14, see Verification below |
+| CUDA extension builds fail (gsplat, fused-ssim, fused-bilagrid, ppisp) | gcc 13 from `build-essential`; CUDA toolkit major = torch's cu130; `TORCH_CUDA_ARCH_LIST=12.0`; cap `MAX_JOBS` so nvcc doesn't exhaust RAM; if fused-ssim fails, swap to torchmetrics SSIM in one `# [splat]` edit |
+| Installing the CUDA toolkit drags in an older driver and breaks the working one | install the toolkit component only (`cuda-toolkit-13-x`), never the `cuda` meta-package |
+| Hooks rely on gsplat internals (`_grow_gs`, `_prune_gs`, ops helper) | pinned commit; re-verified at `28e794ca`; tests fail loudly on upgrade; vendored examples patch kept small |
+| **Thin SfM seed (6,762 points, track length 3.58)** | densification carries it; if the result is poor, shoot more photos before touching hyperparameters — 32 is the low end of the target |
 | Textureless walls → weak SfM | capture protocol; hloc SuperPoint+LightGlue as a fallback matcher |
 | Exposure drift / mirrors / screens | lock exposure; view-dependent artifacts accepted |
-| Snapshot disk usage | fp16 light snapshots (~28 MB per 1M Gaussians); `DATA_ROOT` on local disk |
+| Snapshot disk usage | fp16 light snapshots (~28 MB per 1M Gaussians); `data/` is on the local ext4 disk; `DATA_ROOT` moves it if that fills |
+| Data now lives inside the repo | `.gitignore` excludes `data/`, `photos/`, `*.ply`, `*.bin`, `*.parquet`, `*.db` — check `git status` stays clean after a training run |
 
 ---
 
@@ -262,10 +311,28 @@ Then on the desktop: Phase 0a → `setup_env.sh` (0b) → Phase 2 for real → P
     after append succeeds.
   - **Curriculum:** image ordering and seed-point filtering.
   - **Snapshots:** save/load round-trip.
+- **SfM → gsplat compatibility — ✅ verified 2026-09-14.** `data/scenes/room-1` was replayed through
+  gsplat's real `examples/datasets/colmap.py` Parser logic (helpers extracted from upstream `28e794ca` by
+  AST, so the check tracks upstream rather than a paraphrase), at `--data_factor` 1, 2, 4 and 8. All
+  checks passed at every factor:
+  - `pycolmap.Reconstruction()` reads the **new rig/frame-format model** written by pycolmap 4.2 — the
+    extra `rigs.bin` / `frames.bin` are simply ignored, and `cameras.bin` / `images.bin` / `points3D.bin`
+    parse normally (32 images, 6,762 points);
+  - every attribute the Parser touches resolves: `reg_image_ids()`, `im.cam_from_world.matrix()`,
+    `cam.calibration_matrix()`, `cam.params`, `point.xyz/.error/.color`, `point.track.elements`;
+  - the OPENCV camera maps to `('perspective', k1 k2 p1 p2)`, so gsplat undistorts it itself;
+  - `images/` → `images_N/` filename mapping resolves all 32 paths despite the `.jpeg` → `.png` extension
+    change, and the PNG downscales avoid upstream's "re-resize JPEGs into `images_N_png/`" path;
+  - scaled intrinsics `K/N` match the actual downscaled pixel dimensions exactly at every factor;
+  - the `normalize=True` pipeline runs; note it will apply its **upside-down flip** heuristic to this scene.
+  - Re-run with `scripts/verify_gsplat_compat.py --gsplat <checkout>` after any gsplat version bump: it is
+    the cheapest guard against an upstream parser change silently invalidating the SfM output, and it
+    fails loudly if the helpers it lifts from upstream have been renamed.
 - **Hook neutrality:** the instrumented run matches the vanilla run on Mip-NeRF 360 room (Phase 3 check).
 - **End to end:**
-  1. `run_sfm.py` → `train.py --config incremental --hw auto`
-  2. `view.py --run <dir>` (scrub the timeline)
-  3. `report.py`
-- **Portability:** `setup_env.sh` on the 5090 reproduces the env, and a laptop run dir `rsync`'d over
-  resumes and retrains with `--hw desktop_5090_32gb`.
+  1. `run_sfm.py --images photos/room-1` → `data/scenes/room-1/`
+  2. `train.py --data_dir data/scenes/room-1 --config incremental --hw auto`
+  3. `view.py --run <dir>` (scrub the timeline)
+  4. `report.py`
+- **Portability:** `setup_env.sh` reproduces the env from scratch on a clean Ubuntu 24.04 + r580 driver
+  machine, and a run dir copied in resumes and retrains under a different `--hw` profile.

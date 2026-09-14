@@ -7,13 +7,13 @@ point straight at the output directory.
 Examples
 --------
     # validate paths and show the planned layout, without running COLMAP
-    python scripts/run_sfm.py --images ~/photos/room --out ~/splat_data/room --dry-run
+    python scripts/run_sfm.py --images photos/room-1 --dry-run
 
-    # the real run, on Linux with a GPU
-    python scripts/run_sfm.py --images ~/photos/room --out ~/splat_data/room
+    # the real run; writes data/scenes/room-1/
+    python scripts/run_sfm.py --images photos/room-1
 
     # video frames, or any sequential capture
-    python scripts/run_sfm.py --images ~/frames --out ~/splat_data/room --matcher sequential
+    python scripts/run_sfm.py --images ~/frames --out data/scenes/room-1 --matcher sequential
 """
 
 from __future__ import annotations
@@ -28,9 +28,18 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from splat.sfm import DEFAULT_DOWNSCALES, SfmConfig, format_summary, run_sfm  # noqa: E402
 
 
+def repo_root() -> Path:
+    return Path(__file__).resolve().parents[1]
+
+
 def default_out_root() -> Path:
-    """DATA_ROOT keeps heavy outputs off the repo (and off OneDrive)."""
-    return Path(os.environ.get("DATA_ROOT", Path.home() / "splat_data"))
+    """Scenes live in the repo's data/ directory, which .gitignore excludes.
+
+    Keeping them next to the code means a scene is found by relative path from
+    anywhere in the repo, with no environment to set. DATA_ROOT still overrides
+    it, for a scene that outgrows this disk.
+    """
+    return Path(os.environ.get("DATA_ROOT", repo_root() / "data"))
 
 
 def parse_args(argv=None) -> argparse.Namespace:
@@ -41,7 +50,8 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--images", required=True, type=Path,
                    help="Directory of input photos (read-only).")
     p.add_argument("--out", type=Path, default=None,
-                   help="Output scene directory. Default: $DATA_ROOT/scenes/<images dir name>")
+                   help="Output scene directory. Default: data/scenes/<images dir name>, "
+                        "or $DATA_ROOT/scenes/<images dir name> if DATA_ROOT is set.")
     p.add_argument("--camera-model", default="OPENCV",
                    choices=["OPENCV", "SIMPLE_RADIAL", "RADIAL", "PINHOLE", "FULL_OPENCV"],
                    help="OPENCV suits a phone camera.")
