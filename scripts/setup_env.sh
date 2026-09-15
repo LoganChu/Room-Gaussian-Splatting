@@ -37,6 +37,9 @@ VENDOR_DIR="$REPO/third_party/gsplat_examples"
 LOCKFILE="$REPO/requirements-train.lock"
 # ~2 GB of RAM per nvcc job; leave headroom on a 30 GB machine.
 MAX_JOBS="${MAX_JOBS:-$(( $(nproc) < 8 ? $(nproc) : 8 ))}"
+# The CUDA wheels torch pulls are huge (cuBLAS alone is 400 MB) and uv's default
+# 30s per-request timeout aborts the whole install partway through one of them.
+export UV_HTTP_TIMEOUT="${UV_HTTP_TIMEOUT:-300}"
 
 STEPS=(apt cuda venv gsplat vendor examples freeze verify)
 
@@ -53,7 +56,7 @@ uvpip() { uv pip install --python "$VPY" "$@"; }
 # --- Preflight --------------------------------------------------------------
 
 preflight() {
-  [[ -r /etc/os-release ]] && . /etc/os-release
+  [[ -r /etc/os-release ]] && . /etc/os-release || true
   [[ "${VERSION_ID:-}" == "24.04" ]] || info "WARNING: expected Ubuntu 24.04, found ${PRETTY_NAME:-unknown}"
 
   have nvidia-smi || die "nvidia-smi not found. The driver is Phase 0a and must be working first."
@@ -69,16 +72,23 @@ preflight() {
 
 # --- Steps ------------------------------------------------------------------
 
+# Ubuntu splits Python's C headers into python3-dev; build-essential does NOT
+# pull them in, and the venv is built on the system interpreter. Without them
+# every torch CUDA extension dies on "fatal error: Python.h: No such file or
+# directory" — but only after several minutes of compiling, so check up front.
+has_python_headers() { compgen -G "/usr/include/python3*/Python.h" >/dev/null 2>&1; }
+
 step_apt() {
   say "1/8  Build tools (sudo)"
-  if have gcc && have g++ && have ninja; then
-    info "gcc $(gcc -dumpversion), g++, ninja already present — skipping"
+  if have gcc && have g++ && have ninja && has_python_headers; then
+    info "gcc $(gcc -dumpversion), g++, ninja, Python.h already present — skipping"
     return
   fi
   sudo apt-get update
   # gcc 13 is the 24.04 default and a supported host compiler for CUDA 13.
-  sudo apt-get install -y build-essential ninja-build git curl
-  info "gcc $(gcc -dumpversion)"
+  sudo apt-get install -y build-essential ninja-build python3-dev git curl
+  has_python_headers || die "python3-dev installed but no Python.h under /usr/include/python3*/"
+  info "gcc $(gcc -dumpversion), Python.h OK"
 }
 
 step_cuda() {
@@ -106,6 +116,7 @@ step_cuda() {
 # Exported for every step that compiles.
 cuda_env() {
   [[ -x "$CUDA_HOME_DIR/bin/nvcc" ]] || die "nvcc not found at $CUDA_HOME_DIR — run: $0 --step cuda"
+  has_python_headers || die "Python.h not found — run: $0 --step apt"
   export CUDA_HOME="$CUDA_HOME_DIR"
   export PATH="$CUDA_HOME/bin:$PATH"
   export LD_LIBRARY_PATH="$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}"
@@ -118,6 +129,11 @@ step_venv() {
   [[ -x "$VPY" ]] || uv venv --python "$PYTHON_VERSION"
   # The SfM deps (pillow, pycolmap) stay locked in pyproject/uv.lock.
   uv sync --inexact       # --inexact: do not remove the training deps added below
+  # Build backend. Every CUDA extension below installs with --no-build-isolation,
+  # which means its build sees ONLY this venv — so the backend has to live here.
+  # `uv venv` ships none, and without this all four extension builds fail with
+  # "Cannot import setuptools.build_meta".
+  uvpip setuptools wheel ninja
   uvpip "torch==$TORCH_VERSION" "torchvision==$TORCHVISION_VERSION" --index-url "$TORCH_INDEX"
   "$VPY" - <<'PY'
 import torch
