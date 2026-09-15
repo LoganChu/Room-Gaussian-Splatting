@@ -11,7 +11,8 @@ The helper functions are lifted out of gsplat's own source by AST rather than
 re-implemented, so the check tracks upstream instead of drifting from it. They
 are exec'd individually because importing colmap.py pulls in cv2 and torch.
 
-    python scripts/verify_gsplat_compat.py --gsplat ~/src/gsplat
+    python scripts/verify_gsplat_compat.py                       # vendored examples
+    python scripts/verify_gsplat_compat.py --gsplat ~/src/gsplat  # upstream checkout
 
 Re-run after any gsplat version bump. Exit status is 0 only if every check
 passes at every downscale factor.
@@ -30,17 +31,28 @@ import numpy as np
 HELPERS = {"_as_dict", "_camera_model_name", "_camera_distortion", "_image_w2c", "_get_rel_paths"}
 
 
-def load_upstream(gsplat_dir: Path) -> dict:
+def resolve_examples(path: Path) -> Path:
+    """Accept either a gsplat checkout root or a vendored examples/ directory."""
+    for candidate in (path / "examples", path):
+        if (candidate / "datasets/colmap.py").exists():
+            return candidate
+    raise SystemExit(
+        f"{path} is neither a gsplat checkout nor a vendored examples/ directory "
+        "(no datasets/colmap.py under it)"
+    )
+
+
+def load_upstream(examples: Path) -> dict:
     """exec gsplat's Parser helpers and normalize.py into one namespace."""
     ns: dict = {"np": np, "os": os, "Any": object, "Dict": dict, "List": list}
     sources = [
-        (gsplat_dir / "examples/datasets/colmap.py", HELPERS),
-        (gsplat_dir / "examples/datasets/normalize.py", None),  # all of it
+        (examples / "datasets/colmap.py", HELPERS),
+        (examples / "datasets/normalize.py", None),  # all of it
     ]
     found = set()
     for path, wanted in sources:
         if not path.exists():
-            raise SystemExit(f"not a gsplat checkout: {path} missing")
+            raise SystemExit(f"missing: {path}")
         for node in ast.parse(path.read_text()).body:
             if isinstance(node, ast.FunctionDef) and (wanted is None or node.name in wanted):
                 exec(compile(ast.Module([node], []), str(path), "exec"), ns)
@@ -68,7 +80,7 @@ class Checks:
             self.failures.append(label)
 
 
-def verify(scene: Path, gsplat_dir: Path, factor: int, ns: dict, check: Checks) -> None:
+def verify(scene: Path, factor: int, ns: dict, check: Checks) -> None:
     import pycolmap
     from PIL import Image
 
@@ -154,7 +166,8 @@ def verify(scene: Path, gsplat_dir: Path, factor: int, ns: dict, check: Checks) 
 def main(argv=None) -> int:
     repo = Path(__file__).resolve().parents[1]
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--gsplat", required=True, type=Path, help="Path to a gsplat checkout.")
+    ap.add_argument("--gsplat", type=Path, default=repo / "third_party/gsplat_examples",
+                    help="A gsplat checkout, or a vendored examples/ directory.")
     ap.add_argument("--scene", type=Path, default=repo / "data/scenes/room-1",
                     help="Scene directory written by run_sfm.py.")
     ap.add_argument("--factors", type=int, nargs="+", default=[1, 2, 4, 8],
@@ -164,12 +177,13 @@ def main(argv=None) -> int:
     if not args.scene.exists():
         raise SystemExit(f"scene not found: {args.scene}")
 
-    ns = load_upstream(args.gsplat.expanduser())
-    print(f"[extract] Parser helpers lifted from {args.gsplat}")
+    examples = resolve_examples(args.gsplat.expanduser())
+    ns = load_upstream(examples)
+    print(f"[extract] Parser helpers lifted from {examples}")
 
     check = Checks()
     for factor in args.factors:
-        verify(args.scene, args.gsplat, factor, ns, check)
+        verify(args.scene, factor, ns, check)
 
     if check.failures:
         print(f"\n[result] {len(check.failures)} FAILED: {check.failures}")

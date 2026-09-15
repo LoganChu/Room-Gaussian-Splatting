@@ -90,8 +90,9 @@ splat/
   viewer.py       # playback viewer, built from gsplat examples/simple_viewer.py
   report.py       # plots
 configs/  train/{default,incremental}.yaml · hardware/{desktop_5090_32gb,laptop_5070_8gb}.yaml
-scripts/  setup_env.sh · run_sfm.py (DONE) · viz_sfm.py (DONE) · verify_gsplat_compat.py (DONE)
-          train.py · view.py · report.py
+scripts/  setup_env.sh (DONE, unrun) · run_sfm.py (DONE) · viz_sfm.py (DONE)
+          verify_gsplat_compat.py (DONE) · train.py · view.py · report.py
+requirements-train.lock        # frozen training stack; uv.lock covers only the SfM deps
 docs/     how_it_works.md   # annotated reading guide to gsplat/strategy/default.py, tied to viewer screens
 tests/    test_sfm (DONE, 30 tests) · test_lineage · test_append · test_curriculum · test_snapshots
 ```
@@ -192,9 +193,17 @@ is what `run_sfm.py` needs and nothing more.
     **ppisp** — four CUDA extensions total, so budget real time for this step and set
     `MAX_JOBS` to keep the compile from exhausting RAM;
   - vendors `examples/` from the same commit into `third_party/gsplat_examples/`;
-  - updates `uv.lock` (which replaces `environment.yml`).
-- **Check:** `torch.cuda.get_device_capability() == (12, 0)`, `import gsplat` succeeds, and a 7k-iteration
-  `simple_trainer` run on Mip-NeRF 360 "room" opens the live viewer.
+  - freezes the result to `requirements-train.lock`. Note the split: `uv.lock` covers only the SfM deps
+    declared in `pyproject.toml`, because the training stack is installed imperatively (a git commit, a
+    custom index, `--no-build-isolation`) and cannot be expressed there. The pins at the top of
+    `setup_env.sh` plus that freeze are the reproducibility artifact.
+- **Idempotent and resumable.** Four CUDA extensions is a long build that can fail partway, so every step
+  is separately runnable (`--step gsplat`) and re-running a finished step is a no-op. `--check` verifies an
+  existing install without changing anything.
+- **Check:** the script's last step asserts `torch.cuda.get_device_capability() == (12, 0)`, imports
+  gsplat, and **rasterizes one Gaussian on the GPU** — exercising the compiled kernel, not just the import,
+  which is the difference between "it installed" and "it works". Then a 7k-iteration `simple_trainer` run
+  on Mip-NeRF 360 "room" should open the live viewer.
 - **Note:** the two CUDA-version numbers differ on purpose. The driver reports 13.2 (what it can run);
   torch is built against cu130 (what it was compiled with). A driver newer than the toolkit is the correct
   direction, so this is fine.
@@ -257,7 +266,7 @@ Everything now runs on one machine: the native Ubuntu 5090 desktop. The WSL2 / W
 | Phase | Status | Notes |
 |---|---|---|
 | 0a machine setup | ✅ done | Ubuntu 24.04.5, driver 595.84, CUDA 13.2, sm_120 |
-| 0b toolchain | ⬅️ **next — blocks everything** | no compiler, no CUDA toolkit, no torch, no gsplat yet |
+| 0b toolchain | ⬅️ **next — blocks everything** | `setup_env.sh` written and unrun; needs sudo for apt + CUDA toolkit |
 | 1 baseline + reading guide | todo | needs 0b; Mip-NeRF 360 "room" at 30k as the reference |
 | 2 capture + SfM | ✅ done | `data/scenes/room-1/`, 32/32 registered, 0.93 px |
 | 3 instrumentation | todo | pure Python once gsplat imports; tests tiny and synthetic |
@@ -267,7 +276,7 @@ Everything now runs on one machine: the native Ubuntu 5090 desktop. The WSL2 / W
 
 **Immediate plan:**
 
-1. **Phase 0b** — write and run `scripts/setup_env.sh`. This is the whole blocker.
+1. **Phase 0b** — run `./scripts/setup_env.sh` (written; steps 1-2 need sudo). This is the whole blocker.
 2. **Phase 1** — vanilla `simple_trainer` on Mip-NeRF 360 "room" for the baseline, *and* a first vanilla run
    on `data/scenes/room-1` at `--data_factor 4` just to see the room appear. That first room render is the
    cheapest possible check that Phase 2's output is genuinely trainable end to end.
