@@ -2,8 +2,9 @@
 
 ## Context
 
-**Status: Phase 2 (capture + SfM) is done. Phase 0b (toolchain) is next and is the only thing standing
-between here and a first training run.** See "Phase status" below.
+**Status: Phases 0a, 0b, 1 and 2 are done.** The stack builds, is verified numerically correct against a
+published benchmark, and has trained `room-1` end to end. **Phase 3 (instrumentation) is next.**
+See "Phase status" below.
 
 The goal is to **see, step by step, how 3D Gaussian Splatting (3DGS) works** while reconstructing your room
 from **30–100 phone photos**:
@@ -44,9 +45,19 @@ still true:
 - **Counts are returned.** `_grow_gs()` returns `(n_dupli, n_split)` and `_prune_gs()` returns `n_prune`.
 - **Extra per-Gaussian tensors stay aligned.** `gsplat.strategy.ops` (`duplicate`, `split`, `remove`)
   applies the same indexing or concatenation to **every tensor in the strategy `state` dict** as to the
-  params:
-  - clones are appended at the end;
-  - split children (2 per parent) are appended at the end and their parents removed.
+  params. Layout **verified empirically** on this machine (tagged 5-Gaussian set, real ops):
+  - clones are appended at the end, parents untouched: `[0,1,2,3,4] + mask{1,3} -> [0,1,2,3,4,1,3]`;
+  - split removes the parents and appends children: `[0,1,2,3,4] + mask{1,3} -> [0,2,4,|1,3,1,3]`;
+  - **⚠️ split children are CHILD-MAJOR, not adjacent pairs.** With `rest` kept and `n_split` parents, the
+    two children of parent `i` sit at `rest+i` **and** `rest+n_split+i` — for the example above, positions
+    `(3,5)` and `(4,6)`, *not* `(3,4)` and `(5,6)`. Reading them as adjacent pairs is the natural
+    assumption, is wrong, and **fails silently**: the lineage graph comes out complete and plausible with
+    every child attributed to the wrong parent. `test_lineage` must cover this explicitly.
+  - within one `_grow_gs`, duplicate runs first and the split mask is extended with `n_dupli` zeros, so
+    **clones are never split in the same pass**. Final layout:
+    `[originals not split | clones | split children]`.
+  - split scales are divided by exactly 1.6 (measured factor `0.625`); child positions are sampled
+    anisotropically along the parent's own principal axes.
 - **No op adds Gaussians from given values.** `sample_add` only samples existing ones, but
   `_update_param_with_optimizer` is the reusable helper for writing one.
 - **Example dependencies:** `examples/requirements.txt` uses the **official** `pycolmap>=3.10.0`
@@ -171,11 +182,37 @@ so runs `rsync` between machines.
 - Driver **595.84** is loaded and `nvidia-smi` reports the RTX 5090 with 32 GB and CUDA 13.2. This is
   r580+, as Blackwell requires, so the driver step is finished. Nothing further to do here.
 
-**Phase 0b — Toolchain — ⬅️ NEXT, and the only blocker for training**
+**Phase 0b — Toolchain — ✅ DONE (`scripts/setup_env.sh`, run 2026-09-14)**
 
-Nothing of the training stack exists on this machine yet: **no `gcc`/`g++`, no `nvcc`, no CUDA toolkit, no
-torch, no gsplat.** The only Python environment is the uv `.venv`, holding pillow + pycolmap + pytest, which
-is what `run_sfm.py` needs and nothing more.
+| Component | Installed |
+|---|---|
+| gcc / nvcc | 13 / **13.2** (`/usr/local/cuda-13.2`) |
+| torch | **2.9.1+cu130**, device capability (12, 0) |
+| gsplat | **1.6.0**, built from source for sm_120 |
+| CUDA extensions | gsplat, fused-ssim, fused-bilagrid, ppisp — all verified to *execute*, not just import |
+| Frozen | 107 packages → `requirements-train.lock` |
+
+The gsplat compile took **~50 minutes**, nearly all of it single-threaded in `ptxas` on the templated
+rasterization kernels — `MAX_JOBS` stops helping once the build reaches those few large translation units.
+
+**Three things the first run exposed, all now fixed in the script:**
+1. **`UV_HTTP_TIMEOUT=300`.** uv's 30 s default aborts partway through a 400 MB CUDA wheel.
+2. **`python3-dev`.** `build-essential` does not provide `Python.h`, the venv sits on the system
+   interpreter, and every torch CUDA extension needs it — failing ~5 minutes into the first compile with
+   the cause buried at line 4567 of a 6,659-line log.
+3. **`has_python_headers` is part of step 1's skip condition and of `cuda_env()`.** Without the former,
+   re-running `--step apt` reports "already present" and never installs the missing package. Without the
+   latter, the failure stays slow and illegible.
+
+**Smoke test — the stack trained the real scene.** 300 steps on `data/scenes/room-1` at `--data_factor 8`:
+1.04 s, 354 it/s, **49 MB** of VRAM, PSNR 14.04 / SSIM 0.651. Blobby as expected (densification starts at
+500, SH still degree 0), but the piano, mirrors, frames and patterned cloth all land in the right place at
+the right scale and colour — which is the real result, because it means **the COLMAP poses are
+geometrically sound**. A pose or convention error looks like noise, not a soft version of the room. The
+empty regions are the thin 6,762-point seed showing through.
+
+Incidental find: the trainer reads **EXIF exposure** from all 32 images (mean 2.190 EV) and compensates,
+which partly covers the "exposure drift" risk below.
 
 - **System packages (apt):** `build-essential` (gcc/g++ 13, the 24.04 default and a supported host compiler
   for CUDA 13) and `ninja-build`. Without a compiler nothing below can build.
@@ -208,11 +245,46 @@ is what `run_sfm.py` needs and nothing more.
   torch is built against cu130 (what it was compiled with). A driver newer than the toolkit is the correct
   direction, so this is fine.
 
-**Phase 1 — Baseline and read-through**
-- **Baseline run:** train Mip-NeRF 360 "room" to 30k iterations with vanilla simple_trainer, and record
-  PSNR/SSIM/LPIPS and the Gaussian count. This is the reference for "hooks don't change results".
-- **Reading guide:** write `docs/how_it_works.md` alongside reading `gsplat/strategy/default.py` and the
-  training loop.
+**Phase 1 — Baseline and read-through — ✅ DONE (2026-09-14)**
+
+**The build is numerically correct.** Vanilla `simple_trainer` on Mip-NeRF 360 "room", 30k steps,
+`--data_factor 2`, held-out test set — against gsplat's published table:
+
+| | PSNR | SSIM | LPIPS | Num GS |
+|---|---|---|---|---|
+| gsplat-30k (published) | 31.36 | — | — | 1.59M |
+| inria-30k (published) | 31.31 | — | — | 1.55M |
+| **this build, 30k** | **31.296** | **0.9196** | **0.1633** | **1,573,075** |
+| **this build, 7k** | **29.046** | 0.8953 | 0.2100 | 1,122,119 |
+| gsplat-7k (published) | 29.21 | — | — | 1.11M |
+
+Within **0.06 dB** and **1.1%** on Gaussian count at 30k, and 0.16 dB / 1% at 7k. Matching on *both*
+metrics is the point: PSNR alone could coincide by luck, but the same converged Gaussian count means
+densification took the same decisions. The CUDA 13 / sm_120 build is sound.
+
+**Cost on this machine:** 30,000 steps in **5 min 49 s** (~88 it/s), peak **2.38 GB** VRAM. Roughly 13× the
+headroom on a 32 GB card, so `--data_factor 1` and much larger Gaussian budgets are comfortable.
+
+**Run dir:** `data/runs/baseline-room-30k/` (861 MB, gitignored). **Keep it** — Phase 3's hook-neutrality
+check compares against it directly.
+
+**Scale note for Phase 6:** "room" initialises from **112,627** SfM points; `room-1` from **6,762** — about
+17× fewer. The clearest single argument for shooting more photos.
+
+- **Baseline run (as executed):** vanilla simple_trainer at
+  `--data_factor 2` (what gsplat's own `benchmarks/basic.sh` uses for the indoor scenes), and record
+  PSNR/SSIM/LPIPS and the Gaussian count. It serves **two** purposes:
+  - **Correctness of this build.** "room" is a published benchmark, so the number is checkable against
+    gsplat's and the 3DGS paper's. Landing near it proves the sm_120 kernels are numerically *right*, not
+    merely non-crashing — something `room-1` can never show, having no reference value.
+  - **The control for Phase 3.** The instrumented run must match it (same seed, same final Gaussian count,
+    PSNR within ~0.1 dB), and that comparison needs a vanilla number to exist first.
+- **Data:** `datasets/download_dataset.py --dataset mipnerf360` (one ~12 GB zip, all nine scenes; there is
+  no per-scene download). Lives outside the repo or under gitignored `data/`.
+- **Reading guide — ✅ DONE:** `docs/how_it_works.md`, pinned to `28e794ca`, with line references into
+  `gsplat/strategy/default.py`. Covers the callback shape of a step, the screen-space gradient signal
+  (and why `grow_grad2d` is resolution-independent), clone-vs-split, pruning, opacity reset, the schedule,
+  the verified tensor layout above, and where the four hooks attach.
 
 **Phase 2 — Your data — ✅ DONE (`data/scenes/room-1/`)**
 - **Capture protocol** (as followed): lock exposure, focus and white balance; no zoom; avoid motion blur;
@@ -239,11 +311,56 @@ is what `run_sfm.py` needs and nothing more.
   matching used 8 CPU threads (recorded as a warning in `sfm_report.json`). It cost ~6 s of mapping at this
   scale, so it is not worth chasing a CUDA COLMAP build unless the photo count grows a lot.
 
-**Phase 3 — Instrumentation**
-- **What to add:** `lineage.py`, `events.py`, `snapshots.py`, hooks 1 and 4, and `report.py` (Gaussian count
-  vs. iteration with clone/split/prune/reset markers, plus loss and PSNR curves).
-- **Check:** the instrumented run with the same seed matches the Phase 1 baseline, with the same final
-  Gaussian count and PSNR within about 0.1 dB.
+**Phase 3 — Instrumentation — ✅ DONE**
+- **Added:** `paths.py`, `events.py` (parquet: `step, kind, gid, parent`), `lineage.py`
+  (`InstrumentedStrategy`), `snapshots.py` (fp16 + reader), `report.py`, and hooks 1 and 4 in the vendored
+  trainer behind `--lineage` / `--snapshot-every N`, both **off by default**. 32 new tests (62 total).
+- **Two reports, from two independent sources.** `population.png` comes from `events.parquet`, so only an
+  instrumented run has it. `training.png` reads the TensorBoard scalars `simple_trainer` writes for
+  **every** run — so the Phase 1 vanilla baseline can be reported and compared against without re-running
+  it with hooks. `report(RunPaths)` writes whichever the run has data for.
+- **The training plot independently confirms `docs/how_it_works.md`.** On the 30k baseline the Gaussian
+  count freezes at **exactly 15,000** (`refine_stop_iter`) and shows prune sawteeth at **exactly 3k, 6k,
+  9k and 12k** — the opacity resets — with none afterwards. The documented schedule is observable in the
+  data, not just in the source.
+- **Event log size:** 2.96 bytes/row measured on a real 1.35M-event run, against 20 bytes/row raw.
+  Dictionary-encoded kinds plus zstd; a full 30k run's log stays in the low tens of MB.
+- **The event log balances exactly.** A 3k run on `room-1`: 6,762 sfm + 494,460 clone + 558,384 split −
+  293,999 death = **765,607**, equal to the trainer's own reported `num_GS` to the unit. Books that balance
+  against an independently computed number are the strongest cheap check available.
+
+⚠️ **The original check in this plan was not a valid test, and has been replaced.**
+
+It asked for "the same final Gaussian count and PSNR within about 0.1 dB". Measured here, **two identical
+vanilla runs** differ far more than that:
+
+| config | n | PSNR | Num GS |
+|---|---|---|---|
+| vanilla | 12 | 19.576 ± 0.708 | 762,587 ± 10,157 |
+| instrumented | 12 | 19.259 ± 0.787 | 760,987 ± 14,333 |
+
+`set_random_seed(42)` is called, but the rasterizer's backward accumulates gradients with **atomics in
+nondeterministic order**; one flipped densification decision and the runs diverge permanently. No run can
+meet a 0.1 dB criterion, instrumented or not — the criterion was measuring the harness, not the hooks.
+
+**Replaced by two checks that are actually sound:**
+1. **Exact, in `tests/test_lineage.py`:** given identical inputs, `InstrumentedStrategy` must produce
+   **byte-identical params** to `DefaultStrategy` — asserted for `_grow_gs` (clone-only, split-only, both
+   in one call, no-op) and `_prune_gs`, with the RNG stream pinned around each call. This is exactly
+   reproducible and strictly stronger than matching end metrics.
+2. **Statistical, end-to-end:** PSNR difference −0.317 dB (t = −1.04), Gaussian count −1,600 (t = −0.32) —
+   neither distinguishable from zero at n = 12.
+
+**Method note worth keeping:** at n = 4 the difference looked like 1.69 sd and the instrumented spread
+looked wider. Both vanished by n = 12 — vanilla's own sd rose from 0.295 to 0.708 as samples accumulated.
+Variance estimates from a handful of chaotic runs are close to worthless; 3,000 steps sits mid-densification,
+the most chaotic point in training.
+
+- **Test coverage:** `test_lineage` (14) drives the real gsplat ops; `test_snapshots` (7) round-trips and
+  checks that `shN` is dropped and ids come from `state`, not position; `test_events` (11) covers schema
+  and dtypes through parquet, the empty-batch no-op that every zero-clone refinement hits, rejection of
+  unknown kinds and mismatched parent arrays, the births − deaths invariant over a synthetic run, and the
+  size bound.
 
 **Phase 4 — Playback viewer**
 - **What to add:** `viewer.py` with the timeline, render modes, camera snapping and text panel.
@@ -266,21 +383,23 @@ Everything now runs on one machine: the native Ubuntu 5090 desktop. The WSL2 / W
 | Phase | Status | Notes |
 |---|---|---|
 | 0a machine setup | ✅ done | Ubuntu 24.04.5, driver 595.84, CUDA 13.2, sm_120 |
-| 0b toolchain | ⬅️ **next — blocks everything** | `setup_env.sh` written and unrun; needs sudo for apt + CUDA toolkit |
-| 1 baseline + reading guide | todo | needs 0b; Mip-NeRF 360 "room" at 30k as the reference |
+| 0b toolchain | ✅ done | torch 2.9.1+cu130, gsplat 1.6.0 sm_120, 4 CUDA extensions verified |
+| 1 baseline + reading guide | ✅ done | PSNR 31.296 vs 31.36 published; `docs/how_it_works.md` written |
 | 2 capture + SfM | ✅ done | `data/scenes/room-1/`, 32/32 registered, 0.93 px |
-| 3 instrumentation | todo | pure Python once gsplat imports; tests tiny and synthetic |
-| 4 playback viewer | todo | viser on `localhost:8080`, opened locally |
+| 3 instrumentation | ✅ done | lineage/events/snapshots/report + hooks 1 & 4; neutrality established |
+| 4 playback viewer | ⬅️ **next** | viser on `localhost:8080`; `snapshots.py` + `events.parquet` are its inputs |
 | 5 curriculum | todo | develop at `--data_factor 8`, few images, then scale up |
 | 6 full-quality room run | todo | `--data_factor 1` or 2; the payoff |
 
 **Immediate plan:**
 
-1. **Phase 0b** — run `./scripts/setup_env.sh` (written; steps 1-2 need sudo). This is the whole blocker.
-2. **Phase 1** — vanilla `simple_trainer` on Mip-NeRF 360 "room" for the baseline, *and* a first vanilla run
-   on `data/scenes/room-1` at `--data_factor 4` just to see the room appear. That first room render is the
-   cheapest possible check that Phase 2's output is genuinely trainable end to end.
-3. **Phases 3 → 4 → 5 → 6** in order.
+1. **Phase 4** — `viewer.py`. Its inputs already exist: `snapshots.py` supplies the timeline frames and
+   `events.parquet` supplies the densify/reset markers and the colour-by-origin mode.
+2. **Phases 5 → 6** in order.
+
+**Carry into Phase 5.** The ablation ("N ∈ {3, 5, 10, 20, 40, all} images at equal iteration counts") is
+one run per condition, in the same chaotic mid-densification regime measured above. A 0.5 dB effect there
+is **inside run-to-run noise**. Decide the repeat count before running it, not after seeing the numbers.
 
 **Reproducibility (one machine, but still worth keeping):**
 - **Repo:** `~/Projects/Room-Gaussian-Splatting` on ext4, synced through a git remote.
@@ -312,14 +431,19 @@ Everything now runs on one machine: the native Ubuntu 5090 desktop. The WSL2 / W
 
 ## Verification
 
-- **Unit tests:** `pytest tests/` in the `splat` env.
-  - **Lineage:** run real gsplat grow/prune ops on a tiny synthetic param set, then check that ids are
-    unique, clone and split children point to the right parents, logged counts equal the returned counts,
-    and pruned ids are recorded.
+- **Unit tests:** `.venv/bin/python -m pytest tests/` (62 passing).
+  - **Lineage:** runs the **real** gsplat grow/prune ops on a tiny synthetic param set — never a mock,
+    since what is being tested is our reading of gsplat's internal layout. Covers unique ids, correct
+    parents for clones and splits, the child-major ordering, split parents recorded as deaths so
+    births − deaths equals the population, exact prune ids, ids never reused, and the byte-identical
+    equivalence with `DefaultStrategy` described in Phase 3.
   - **Append:** params, Adam state and every `state` tensor keep the same length, and an optimizer step
     after append succeeds.
   - **Curriculum:** image ordering and seed-point filtering.
-  - **Snapshots:** save/load round-trip.
+  - **Snapshots:** save/load round-trip, `shN` excluded, ids taken from `state` rather than row position
+    (after densification they are not `arange`, and colouring by lineage depends on the real ones).
+  - **Events:** schema and dtypes survive parquet, empty batches write nothing, bad input is rejected,
+    births − deaths equals the population, and the log stays compact.
 - **SfM → gsplat compatibility — ✅ verified 2026-09-14.** `data/scenes/room-1` was replayed through
   gsplat's real `examples/datasets/colmap.py` Parser logic (helpers extracted from upstream `28e794ca` by
   AST, so the check tracks upstream rather than a paraphrase), at `--data_factor` 1, 2, 4 and 8. All

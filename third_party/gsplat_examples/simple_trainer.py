@@ -14,9 +14,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import dataclasses  # [splat]
 import json
 import math
 import os
+import sys  # [splat]
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -73,6 +75,12 @@ from gsplat.cuda._wrapper import CameraModel
 from gsplat.strategy import DefaultStrategy, MCMCStrategy
 from gsplat_viewer import GsplatViewer, GsplatRenderTabState
 from nerfview import CameraState, RenderTabState, apply_float_colormap
+
+# [splat] the repo root, so `splat` is importable when this file is run directly
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from splat.events import EventLog  # noqa: E402
+from splat.lineage import InstrumentedStrategy  # noqa: E402
+from splat.snapshots import SnapshotWriter  # noqa: E402
 
 
 @dataclass
@@ -176,6 +184,12 @@ class Config:
     far_plane: float = 1e10
 
     # Strategy for GS densification
+    # [splat] Track Gaussian lineage: swaps in InstrumentedStrategy, which
+    # subclasses DefaultStrategy and changes no behaviour, and writes
+    # events.parquet next to the checkpoints.
+    lineage: bool = False
+    # [splat] Write a light fp16 snapshot every N steps (0 disables).
+    snapshot_every: int = 0
     strategy: Union[DefaultStrategy, MCMCStrategy] = field(
         default_factory=DefaultStrategy
     )
@@ -503,6 +517,28 @@ class Runner:
         self.stage = Stage()
         self.stage.add_scene(self.scene, self.rasterize_splats)
         print("Model initialized. Number of GS:", len(self.splats["means"]))
+
+        # [splat] hook 1: swap DefaultStrategy -> InstrumentedStrategy, carrying
+        # every configured field across so the two runs are identical but for the
+        # bookkeeping. MCMCStrategy is out of scope and left alone.
+        self.events = None
+        self.snapshots = SnapshotWriter(
+            Path(cfg.result_dir) / "snapshots",
+            every=cfg.snapshot_every,
+            enabled=cfg.snapshot_every > 0 and world_rank == 0,
+        )
+        if cfg.lineage and world_rank == 0:
+            if isinstance(self.cfg.strategy, MCMCStrategy):
+                raise ValueError("--lineage requires the default strategy, not MCMC")
+            self.events = EventLog(Path(cfg.result_dir) / "events.parquet")
+            if not isinstance(self.cfg.strategy, InstrumentedStrategy):
+                base = self.cfg.strategy
+                self.cfg.strategy = InstrumentedStrategy(
+                    **{f.name: getattr(base, f.name) for f in dataclasses.fields(base)},
+                    events=self.events,
+                )
+            else:
+                self.cfg.strategy.events = self.events
 
         # Densification Strategy
         self.cfg.strategy.check_sanity(self.splats, self.optimizers)
@@ -1174,6 +1210,12 @@ class Runner:
                 )
             else:
                 assert_never(self.cfg.strategy)
+
+            # [splat] hook 4: snapshot after the population has settled for this
+            # step, so the file matches the counts the strategy just reported.
+            self.snapshots.maybe_save(step, self.splats, self.strategy_state)
+            if self.events is not None and step == max_steps - 1:
+                self.events.flush()
 
             # eval the full set
             if step in [i - 1 for i in cfg.eval_steps]:
