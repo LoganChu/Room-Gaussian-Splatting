@@ -98,14 +98,17 @@ splat/
   curriculum.py   # image order, active-image sampler, stage schedule, before/after renders
   snapshots.py    # light fp16 snapshots (means, scales, quats, opacity, SH-DC, ids) + reader
   events.py       # densify / reset / stage events → parquet
-  viewer.py       # playback viewer, built from gsplat examples/simple_viewer.py
+  timeline.py     # DONE — snapshots + events as one index: lineage, ages, narration
+  viewer.py       # DONE — playback viewer, built from gsplat examples/simple_viewer.py
   report.py       # plots
 configs/  train/{default,incremental}.yaml · hardware/{desktop_5090_32gb,laptop_5070_8gb}.yaml
 scripts/  setup_env.sh (DONE, unrun) · run_sfm.py (DONE) · viz_sfm.py (DONE)
-          verify_gsplat_compat.py (DONE) · train.py · view.py · report.py
+          verify_gsplat_compat.py (DONE) · view.py (DONE) · train.py · report.py
 requirements-train.lock        # frozen training stack; uv.lock covers only the SfM deps
 docs/     how_it_works.md   # annotated reading guide to gsplat/strategy/default.py, tied to viewer screens
-tests/    test_sfm (DONE, 30 tests) · test_lineage · test_append · test_curriculum · test_snapshots
+tests/    test_sfm (DONE, 30) · test_lineage (DONE, 14) · test_events (DONE, 11)
+          test_snapshots (DONE, 7) · test_timeline (DONE, 30) · test_viewer (DONE, 16)
+          test_append · test_curriculum
 ```
 
 ### The four hooks into the vendored trainer (small, marked edits)
@@ -151,7 +154,7 @@ tests/    test_sfm (DONE, 30 tests) · test_lineage · test_append · test_curri
 | 0–500 | shapes/colors optimize, no densification | render vs GT error shrinks |
 | 500–15k, every 100 | clone (small + high gradient), split (large + high gradient), prune (transparent) | color-by-origin mode; count plot with markers |
 | Every 3k | opacity reset → prune spike, brief PSNR dip | report + event markers |
-| Every 1k | SH degree +1 → view-dependent shine | orbit a glossy surface |
+| Every 1k | SH degree +1 → view-dependent shine | orbit a glossy surface — **checkpoint only**, see Phase 4 |
 | 15k–30k | refinement only | PSNR plateau |
 | Incremental mode | each new image: blind guess → learned | before/after panel, orange frustum |
 
@@ -362,9 +365,55 @@ the most chaotic point in training.
   unknown kinds and mismatched parent arrays, the births − deaths invariant over a synthetic run, and the
   size bound.
 
-**Phase 4 — Playback viewer**
-- **What to add:** `viewer.py` with the timeline, render modes, camera snapping and text panel.
-- **Check:** scrub from the SfM cloud to the final model and follow one Gaussian's split lineage.
+**Phase 4 — Playback viewer — ✅ DONE**
+- **Added:** `timeline.py` + `viewer.py` + `scripts/view.py`, and 46 tests (108 total).
+- **Why two modules and not the one the plan listed.** `viewer.py` is viser callbacks and CUDA; the
+  lineage arithmetic behind colour-by-origin and "follow this Gaussian" is neither, and a wrong read of
+  it produces a picture that is coherent, pretty and false — the exact failure `test_lineage.py` guards
+  on the way *in*. So the index lives in `timeline.py`, pure numpy over the run dir, and 30 of the 46
+  new tests run headlessly against a hand-worked synthetic run.
+- **The timeline.** Slider over the snapshot steps, with ticks at densification start and each opacity
+  reset; prev/next, and play at 1–20 fps. Frames are LRU-cached (4): ~100 ms to decompress a 900k-Gaussian
+  snapshot and ~100 ms to upload it, which is fine for one scrub and not for dragging.
+- **Render modes.** gsplat's own (rgb, depth, alpha) plus **colour by origin** (sfm/seed/clone/split, the
+  same palette `population.png` uses, so a Gaussian is the same colour in both) and **age**, normalised
+  to the frame rather than the run — late on, nearly everything is young and a fixed scale is one flat
+  colour. Plus an **ellipsoids** toggle that shrinks and de-fades every splat, since at full size a
+  cloud is a blended sum and individual Gaussians are not what you are looking at.
+- **Lineage.** Enter a gid or sample one, and get its chain to the SfM point, its whole clan, isolation,
+  and a fly-to. **The fly-to is not a convenience.** Measured on `room-1` at step 3900: a 7,992-Gaussian
+  family descended from one SfM point spans ~3×2×8 world units in a 20×25×25 scene and is visible from
+  5 of the 32 training cameras. Isolate one while pointed elsewhere and you get an empty frame with no
+  hint why.
+- **Cameras.** Frustums coloured by role (train green, test blue; grey/orange reserved for Phase 5), and
+  snap-to-camera with a GT | render | error triptych. Poses come from `Parser(normalize=...)` built with
+  the run's own `cfg.yml`, not re-derived from the COLMAP model: `normalize=True` applies a similarity
+  transform, a principal-axis alignment and sometimes a 180° flip before training starts, so the
+  snapshots are in the *normalized* frame and a re-derived frustum lands plausibly, subtly wrong. GT
+  comes from upstream's own `Dataset`, so the undistortion is theirs and cannot drift from it.
+- **`cfg.yml` is read without executing it.** The trainer dumps it with `yaml.dump`, so the strategy
+  arrives as a `!!python/object:` tag; run dirs are meant to `rsync`. Safe loader, unknown tags degraded
+  to plain mappings, which is all the viewer wants from them.
+- **Found and fixed an upstream bug.** gsplat 1.6.0's `rasterization` drops `colors` for depth-only
+  modes but still validates `sh_degree` against it, so `sh_degree=0` + `render_mode="D"` raises
+  `sh_degree must be None when colors is None`. `examples/simple_viewer.py` has the same defect on its
+  `--ckpt` path. Guarded by asking gsplat's own `render_mode_has_color`, so it tracks upstream.
+- **Degrades instead of refusing.** No `events.parquet` → no origin/age/lineage, timeline still scrubs.
+  Unreachable `data_dir` → no frustums, timeline still scrubs. A gid with no birth event draws grey.
+- **⚠️ It cannot show view-dependent shine.** Snapshots drop `shN` (`snapshots.py`), so playback renders
+  view-independent colour; the SH degree the panel reports is the degree *training* had reached, not what
+  is being drawn. The "orbit a glossy surface" row of the story table is a checkpoint-only view — use
+  `simple_viewer.py --ckpt`. Trading it away is what keeps a 120-snapshot timeline on disk at all.
+- **Check — ✅ passed** on `data/runs/dev-room-4k` (4k steps, `--data_factor 8`, 40 snapshots, 1.40M ids).
+  Scrubbed 0 → 3900: the blobby SfM render at 0, still blobby at 400 (warm-up), sharpening from 600 as
+  densification starts, recognisable room by 3900. Followed gid 1262390 — a clone at step 3500, depth 27
+  below SfM point 3368 — up its chain and out to its 13,523-id clan, 7,992 alive, isolated and rendered.
+  Snap-to-camera on image 001 gives 23.76 dB against GT at 3900 (train view, no `shN`) versus 7.67 dB at
+  step 0.
+- **Snapshot disk cost is the open worry.** 40 snapshots of this run are **399 MB** — ~10 MB each at
+  ~900k Gaussians, matching `snapshots.py`'s ~29 B/Gaussian. Phase 6 at `--data_factor` 1–2 with ~5M
+  Gaussians and 120 snapshots extrapolates to **~17 GB for one run**. Decide the Phase 6 cadence (or a
+  step-range window) before launching it, not after filling the disk.
 
 **Phase 5 — Image-by-image curriculum**
 - **What to add:** `curriculum.py`, `append.py`, hooks 2 and 3, before/after renders, Δ maps, and ablation
@@ -387,15 +436,16 @@ Everything now runs on one machine: the native Ubuntu 5090 desktop. The WSL2 / W
 | 1 baseline + reading guide | ✅ done | PSNR 31.296 vs 31.36 published; `docs/how_it_works.md` written |
 | 2 capture + SfM | ✅ done | `data/scenes/room-1/`, 32/32 registered, 0.93 px |
 | 3 instrumentation | ✅ done | lineage/events/snapshots/report + hooks 1 & 4; neutrality established |
-| 4 playback viewer | ⬅️ **next** | viser on `localhost:8080`; `snapshots.py` + `events.parquet` are its inputs |
-| 5 curriculum | todo | develop at `--data_factor 8`, few images, then scale up |
+| 4 playback viewer | ✅ done | `timeline.py`/`viewer.py`/`view.py`; verified on `dev-room-4k`, 108 tests |
+| 5 curriculum | ⬅️ **next** | develop at `--data_factor 8`, few images, then scale up |
 | 6 full-quality room run | todo | `--data_factor 1` or 2; the payoff |
 
 **Immediate plan:**
 
-1. **Phase 4** — `viewer.py`. Its inputs already exist: `snapshots.py` supplies the timeline frames and
-   `events.parquet` supplies the densify/reset markers and the colour-by-origin mode.
-2. **Phases 5 → 6** in order.
+1. **Phase 5** — `curriculum.py`, `append.py`, hooks 2 and 3. The viewer's frustum roles already have
+   `pending` (grey) and `added` (orange) wired in with nowhere to come from yet; the curriculum is what
+   fills them, and `ORIGIN_COLORS` already reserves green for the `seed` births `append.py` will log.
+2. **Phase 6** after it — but settle the snapshot cadence first (see Phase 4's disk note).
 
 **Carry into Phase 5.** The ablation ("N ∈ {3, 5, 10, 20, 40, all} images at equal iteration counts") is
 one run per condition, in the same chaotic mid-densification regime measured above. A 0.5 dB effect there
@@ -431,7 +481,7 @@ is **inside run-to-run noise**. Decide the repeat count before running it, not a
 
 ## Verification
 
-- **Unit tests:** `.venv/bin/python -m pytest tests/` (62 passing).
+- **Unit tests:** `.venv/bin/python -m pytest tests/` (108 passing).
   - **Lineage:** runs the **real** gsplat grow/prune ops on a tiny synthetic param set — never a mock,
     since what is being tested is our reading of gsplat's internal layout. Covers unique ids, correct
     parents for clones and splits, the child-major ordering, split parents recorded as deaths so
@@ -444,6 +494,17 @@ is **inside run-to-run noise**. Decide the repeat count before running it, not a
     (after densification they are not `arange`, and colouring by lineage depends on the real ones).
   - **Events:** schema and dtypes survive parquet, empty batches write nothing, bad input is rejected,
     births − deaths equals the population, and the log stays compact.
+  - **Timeline:** a four-point cloud through three refinements, with every answer worked out by hand —
+    origins per Gaussian, the ancestor chain to the SfM point, transitive descendants, the clan from any
+    member, split parents recorded dead, ages, reset steps, per-refinement clone/split/prune counts, and
+    the narration naming the right phase. Plus the degradations: an unknown gid draws grey rather than
+    raising, a death with no birth does not stretch the index, a run with no `events.parquet` still
+    scrubs, and `cfg.yml`'s `!!python/object:` tag is read without being executed.
+  - **Viewer:** the part that is neither viser nor CUDA — that log scales and logit opacities stay raw
+    (activating them at load would double-apply `exp`/`sigmoid` at render time), that the lineage modes
+    hand the rasterizer flat RGB with `sh_degree=None` while rgb hands it SH DC with `0`, that selection
+    masks by gid rather than row position, LRU eviction order, the fly-to bounding sphere, and that a
+    missing scene costs the frustums and not the timeline.
 - **SfM → gsplat compatibility — ✅ verified 2026-09-14.** `data/scenes/room-1` was replayed through
   gsplat's real `examples/datasets/colmap.py` Parser logic (helpers extracted from upstream `28e794ca` by
   AST, so the check tracks upstream rather than a paraphrase), at `--data_factor` 1, 2, 4 and 8. All
@@ -465,7 +526,8 @@ is **inside run-to-run noise**. Decide the repeat count before running it, not a
 - **End to end:**
   1. `run_sfm.py --images photos/room-1` → `data/scenes/room-1/`
   2. `train.py --data_dir data/scenes/room-1 --config incremental --hw auto`
-  3. `view.py --run <dir>` (scrub the timeline)
+  3. `view.py --run <dir>` (scrub the timeline); `view.py --run <dir> --check` reports what a run has
+     — snapshot count and range, whether it was instrumented, its schedule — without opening a browser
   4. `report.py`
 - **Portability:** `setup_env.sh` reproduces the env from scratch on a clean Ubuntu 24.04 + r580 driver
   machine, and a run dir copied in resumes and retrains under a different `--hw` profile.
