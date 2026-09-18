@@ -9,7 +9,8 @@ Built on the same stack as gsplat's ``examples/simple_viewer.py`` -- viser,
 ``nerfview.Viewer``, and ``GsplatViewer`` from the vendored examples -- so the
 familiar rendering controls come for free and this file only adds what is ours:
 
-- a **timeline** over the snapshot steps, with the opacity resets marked;
+- a **timeline** over the snapshot steps, with the opacity resets and the
+  curriculum's stage boundaries marked;
 - **colour by origin** (sfm / seed / clone / split) and **by age**, from
   ``events.parquet`` -- the modes that turn a grey cloud into a history;
 - **lineage isolation**: pick a Gaussian, see its whole clan and nothing else;
@@ -17,6 +18,17 @@ familiar rendering controls come for free and this file only adds what is ours:
   rather than their blended sum, are what you are looking at;
 - **camera snap**: jump to a training view with its GT, render and error side
   by side.
+
+On a curriculum run it also answers "what did this photo do":
+
+- **frustums by role** -- active green, pending grey, the photo the current
+  stage just added orange, the held-out set blue throughout. They repaint as
+  the timeline moves, reconstructed from the curriculum order and the active
+  count, so the viewer never needs the trainer's live state.
+- **changed by this stage** -- per-Gaussian movement over the stage in force at
+  this step, from ``deltas/stage_NNN.npz``. Gaussians that were not alive at
+  both ends of the stage are drawn near-black: "born during this stage" and
+  "did not move" are different statements and must not share a colour.
 
 What it cannot show
 -------------------
@@ -40,25 +52,31 @@ import torch
 
 from . import timeline as tl
 from .paths import RunPaths, repo_root
+from .report import error_map, psnr, strip
 
 #: the vendored gsplat examples, pinned to the same commit as the gsplat
 #: package; importing the real Parser/Dataset rather than paraphrasing them is
 #: the same principle scripts/verify_gsplat_compat.py enforces
 _VENDOR = repo_root() / "third_party" / "gsplat_examples"
 
-#: frustum colours by role. active/pending/added are Phase 5's curriculum
-#: states; a Phase 4 run only ever has train and test.
+#: frustum colours by role. A Phase 4 run only ever has train and test; the
+#: rest are curriculum states. ``resting`` only occurs in groups mode, where
+#: one group trains at a time and the images already seen wait their turn --
+#: a dimmer green, because "seen and seeded" is much closer to active than to
+#: never-seen, and colouring it grey would read as "not in the run".
 ROLE_COLORS: Dict[str, Tuple[int, int, int]] = {
     "train": (64, 192, 87),  # green
     "test": (51, 154, 240),  # blue
     "pending": (134, 142, 150),  # grey
     "added": (253, 126, 20),  # orange
+    "resting": (34, 105, 50),  # dark green
 }
 
 #: our modes, appended to the ones GsplatViewer already offers
 ORIGIN_MODE = "color by origin"
 AGE_MODE = "age"
-EXTRA_MODES = (ORIGIN_MODE, AGE_MODE)
+DELTA_MODE = "changed by this stage"
+EXTRA_MODES = (ORIGIN_MODE, AGE_MODE, DELTA_MODE)
 
 
 def _import_vendored():
@@ -130,6 +148,14 @@ class Playback:
         if mode == AGE_MODE and lineage is not None:
             rgb = tl.colors_by_age(lineage, f["ids_np"], step)
             return torch.from_numpy(rgb).to(self.device), None
+        if mode == DELTA_MODE:
+            stage = self.timeline.stage_at(step)
+            deltas = None if stage is None else self.timeline.deltas(stage.index)
+            if deltas is not None:
+                rgb = tl.colors_by_delta(f["ids_np"], deltas)
+                return torch.from_numpy(rgb).to(self.device), None
+            # no delta record for this stage: fall through to RGB rather than
+            # draw a uniform colour that would read as "nothing changed"
         return f["sh0"], 0
 
     def extent(
@@ -225,6 +251,15 @@ class Cameras:
         return len(self.cameras)
 
     @property
+    def train_items(self) -> List[int]:
+        """Parser image index for each dataset item index.
+
+        The curriculum speaks item indices and ``Camera.index`` is a parser
+        index; this is the one place they are converted, as in curriculum.py.
+        """
+        return [int(i) for i in self._splits["train"].indices]
+
+    @property
     def names(self) -> List[str]:
         return [f"{c.index:03d} {c.name} [{c.role}]" for c in self.cameras]
 
@@ -268,22 +303,13 @@ class Cameras:
 
 def error_triptych(gt: np.ndarray, render: np.ndarray, colormap: str = "turbo") -> np.ndarray:
     """``[GT | render | |error|]`` as one uint8 image, for the camera panel."""
-    from matplotlib import colormaps
-
-    gt_f = gt.astype(np.float32) / 255.0
-    err = np.abs(gt_f - render).mean(-1)
-    # scaled to this pair, not to 1.0: late in a run the absolute error is small
-    # everywhere and a fixed scale shows a black rectangle
-    err = err / max(float(err.max()), 1e-6)
-    err_rgb = colormaps[colormap](err)[..., :3]
-    panels = [gt_f, np.clip(render, 0, 1), err_rgb]
-    return (np.concatenate(panels, axis=1) * 255).astype(np.uint8)
-
-
-def psnr(gt: np.ndarray, render: np.ndarray) -> float:
-    gt_f = gt.astype(np.float32) / 255.0
-    mse = float(np.mean((gt_f - np.clip(render, 0, 1)) ** 2))
-    return float("inf") if mse == 0 else -10.0 * float(np.log10(mse))
+    return strip(
+        [
+            gt.astype(np.float32) / 255.0,
+            np.clip(render, 0, 1),
+            error_map(gt, render, colormap=colormap),
+        ]
+    )
 
 
 # --------------------------------------------------------------------------
@@ -452,6 +478,7 @@ def _viewer_cls():
             server.gui.set_panel_label("run playback")
             if self.cameras is not None:
                 self._add_frustums()
+                self._recolour_frustums(int(self.render_tab_state.step))
 
         # -- state ---------------------------------------------------------
 
@@ -470,16 +497,32 @@ def _viewer_cls():
 
         # -- timeline ------------------------------------------------------
 
-        def _marks(self) -> List[Tuple[float, str]]:
-            """Reset and densification-start ticks, in slider (index) space."""
+        def _marks(self) -> List[Tuple[float, Optional[str]]]:
+            """Ticks in slider (index) space: densify start, resets, stages.
+
+            Stage boundaries get an unlabelled tick. A 28-photo curriculum has
+            26 of them and labelling every one turns the slider into a wall of
+            text; the text panel names the stage you are actually on.
+            """
             steps = np.asarray(self.timeline.steps)
-            marks: List[Tuple[float, str]] = []
-            interesting = [(self.timeline.schedule.refine_start_iter, "densify")]
+            if not steps.size:
+                return []
+            marks: List[Tuple[float, Optional[str]]] = []
+            seen = set()
+            interesting: List[Tuple[int, Optional[str]]] = [
+                (self.timeline.schedule.refine_start_iter, "densify")
+            ]
             interesting += [(int(s), "reset") for s in self.timeline.resets]
+            interesting += [(int(s), None) for s in self.timeline.stage_steps]
             for at, label in interesting:
-                if steps.size and steps.min() <= at <= steps.max():
-                    marks.append((float(int(np.argmin(np.abs(steps - at)))), label))
-            return marks
+                if not (steps.min() <= at <= steps.max()):
+                    continue
+                index = int(np.argmin(np.abs(steps - at)))
+                if index in seen:
+                    continue
+                seen.add(index)
+                marks.append((float(index), label))
+            return sorted(marks, key=lambda m: m[0])
 
         def _populate_timeline_tab(self):
             server = self.server
@@ -521,6 +564,7 @@ def _viewer_cls():
                     self.render_tab_state.step = step
                     step_label.value = step
                     panel.content = self._narration(step)
+                    self._recolour_frustums(step)
                     self.rerender(_)
 
                 @back.on_click
@@ -678,6 +722,31 @@ def _viewer_cls():
                         position=c2w[:3, 3],
                     )
                 )
+
+        def _recolour_frustums(self, step: int) -> None:
+            """Repaint the frustums for the curriculum state at ``step``.
+
+            Active green, resting dark green, pending grey, the photo this
+            stage just introduced orange, and the held-out set blue throughout
+            -- a test camera has no curriculum role, which is the point of it.
+            """
+            if self.cameras is None or not self.timeline.is_curriculum:
+                return
+            items = self.cameras.train_items
+            role: Dict[int, str] = {}
+            roles = self.timeline.active_images(step)
+            for name, group in (
+                ("pending", roles.pending),
+                ("resting", roles.resting),
+                ("train", roles.active),
+            ):
+                for item in group:
+                    if 0 <= item < len(items):
+                        role[items[item]] = name
+            if roles.added is not None and 0 <= roles.added < len(items):
+                role[items[roles.added]] = "added"
+            for handle, cam in zip(self._frustums, self.cameras.cameras):
+                handle.color = ROLE_COLORS[role.get(cam.index, cam.role)]
 
         def _populate_camera_tab(self):
             server = self.server

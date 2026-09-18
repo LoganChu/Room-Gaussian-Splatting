@@ -8,9 +8,16 @@ rather than parsed in full.
 Schema
 ------
     step    int32   training iteration the event happened on
-    kind    str     sfm | seed | clone | split | death | reset
+    kind    str     sfm | seed | clone | split | death | reset | stage
     gid     int64   the Gaussian this is about (-1 for reset, which is global)
     parent  int64   the Gaussian it came from (-1 for sfm, seed, death, reset)
+
+``stage`` is the one row that is not about a Gaussian: it marks a curriculum
+stage beginning, and its ``gid`` carries the **dataset item index of the image
+added** rather than a Gaussian id. That is a deliberate pun on the column, kept
+because it lets the viewer label a timeline marker with the photo that caused
+it from the event log alone. The richer per-stage record -- renders, metrics,
+seed counts -- does not fit four columns and lives in ``stages.json``.
 
 Births carry their reason in ``kind``, so "where did this Gaussian come from"
 and "when" are the same lookup. Deaths are recorded by id only; the id is never
@@ -25,7 +32,9 @@ from typing import List, Optional
 import numpy as np
 
 BIRTH_KINDS = ("sfm", "seed", "clone", "split")
-KINDS = BIRTH_KINDS + ("death", "reset")
+#: events that are about the run rather than about a Gaussian
+GLOBAL_KINDS = ("reset", "stage")
+KINDS = BIRTH_KINDS + ("death",) + GLOBAL_KINDS
 
 _NONE = -1
 
@@ -77,6 +86,10 @@ class EventLog:
     def add_reset(self, step: int) -> None:
         """An opacity reset: global, so it has no gid or parent."""
         self.add(step, "reset", np.array([_NONE], dtype=np.int64))
+
+    def add_stage(self, step: int, image: int = _NONE) -> None:
+        """A curriculum stage beginning. ``image`` is a dataset item index."""
+        self.add(step, "stage", np.array([int(image)], dtype=np.int64))
 
     def to_arrays(self) -> dict:
         if not self._step:

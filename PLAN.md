@@ -94,8 +94,11 @@ splat/
   sfm.py          # DONE — COLMAP SfM (Phase 2)
   paths.py        # repo data/ root (DATA_ROOT override) + run-dir layout
   lineage.py      # InstrumentedStrategy(DefaultStrategy) — see below
-  append.py       # append_gaussians(): seed injection built on ops._update_param_with_optimizer
-  curriculum.py   # image order, active-image sampler, stage schedule, before/after renders
+  append.py       # DONE — append_gaussians(): seed injection on ops._update_param_with_optimizer
+  curriculum.py   # DONE — image order, stage schedule, seed selection (pure numpy)
+  stages.py       # DONE — active-image sampler + stage boundary: seeds, before/after, deltas
+                  #        (incremental and groups modes; exposure recorded either way)
+  ablation.py     # DONE — images-vs-quality analysis and the power arithmetic
   snapshots.py    # light fp16 snapshots (means, scales, quats, opacity, SH-DC, ids) + reader
   events.py       # densify / reset / stage events → parquet
   timeline.py     # DONE — snapshots + events as one index: lineage, ages, narration
@@ -103,12 +106,14 @@ splat/
   report.py       # plots
 configs/  train/{default,incremental}.yaml · hardware/{desktop_5090_32gb,laptop_5070_8gb}.yaml
 scripts/  setup_env.sh (DONE, unrun) · run_sfm.py (DONE) · viz_sfm.py (DONE)
-          verify_gsplat_compat.py (DONE) · view.py (DONE) · train.py · report.py
+          verify_gsplat_compat.py (DONE) · view.py (DONE) · ablate.py (DONE)
+          train.py · report.py
 requirements-train.lock        # frozen training stack; uv.lock covers only the SfM deps
 docs/     how_it_works.md   # annotated reading guide to gsplat/strategy/default.py, tied to viewer screens
-tests/    test_sfm (DONE, 30) · test_lineage (DONE, 14) · test_events (DONE, 11)
-          test_snapshots (DONE, 7) · test_timeline (DONE, 30) · test_viewer (DONE, 16)
-          test_append · test_curriculum
+tests/    test_sfm (30) · test_lineage (14) · test_events (11) · test_snapshots (7)
+          test_timeline (43) · test_viewer (17) · test_append (20) · test_curriculum (48)
+          test_stages (30, incl. an AST check on the vendored trainer patch)
+          test_report (17) · test_ablation (26)          — 262 total
 ```
 
 ### The four hooks into the vendored trainer (small, marked edits)
@@ -128,11 +133,42 @@ tests/    test_sfm (DONE, 30) · test_lineage (DONE, 14) · test_events (DONE, 1
 - **Prunes:** wrap `_prune_gs`. Ids present before but missing after are logged as deaths.
 - **Opacity resets:** each reset step is logged as an event.
 
-### Incremental image curriculum (image-by-image)
+### Image curriculum — two modes
+
+**Why two.** The incremental design is the narrative one: images accumulate one at a time, which is the
+only way a photo can be rendered *before* the model has ever seen it. But it is a poor instrument. Under
+uniform sampling from a growing pool, expected gradient steps per image is
+`Σ stage_length / n_active`, and on `room-1` with constant-length stages that spans **385 steps for the
+first image and 5 for the last — 71×**, still 7× inside a photo's own measurement window. A per-photo
+improvement measured that way is partly measuring stage length over pool size.
+
+| | incremental | groups |
+|---|---|---|
+| **for** | the story, the viewer, the blind guess | measurement, per-image comparison |
+| schedule | one image added per stage | G disjoint groups, round-robin for R rounds |
+| sampler draws from | everything active | the current group only |
+| exposure spread (room-1, 28 images) | **26×** with proportional pacing (60× without) | **1.00×**, by construction |
+| blind guesses | one per photo (25) | one per group first visit (7) |
+
+**`steps_per_image` fixes the measurement window, not the total.** Stage length becomes
+`e · n_active`, so every active image gets exactly `e` of its own steps per stage whatever the pool size
+— measured 1.00× against 7.00× before. It cannot fix the total, and no incremental design can: an image
+added third is present for twenty more stages than one added last. That asymmetry *is* "incremental".
+Only round-robin groups equalise totals.
+
+**Both modes record `exposure` and `exposure_spread` in `stages.json`**, and the report's fourth panel
+draws it — green with "per-photo gains above are comparable" when it is 1.0, red with "NOT comparable"
+otherwise. The number that says how much to trust the chart above it should not be something a reader has
+to go and derive.
 
 - **Poses:** SfM runs once on all images, so every stage shares one coordinate frame.
 - **Order:** start with the 3 images sharing the most 3D points. Then repeatedly add the image sharing the
-  most points with the active set.
+  most points with the active set. Groups mode partitions *this same ordering*, so a group is a
+  contiguous run of it rather than an arbitrary subset.
+- **`active` vs `seen`:** `active` is what the sampler may draw from now; `seen` is everything visited so
+  far. Equal in incremental mode. In groups mode training is restricted to one group but **seeding stays
+  cumulative** — a point shared by two images in different groups would never have two *active* views at
+  once, so keying seeds on `active` would starve exactly the points that tie the groups together.
 - **Seed points:** adding an image calls `append_gaussians()` for SfM points that just became triangulable
   (at least 2 active images in their track) and are far from existing Gaussians. Their birth reason is
   `seed`.
@@ -410,16 +446,179 @@ the most chaotic point in training.
   below SfM point 3368 — up its chain and out to its 13,523-id clan, 7,992 alive, isolated and rendered.
   Snap-to-camera on image 001 gives 23.76 dB against GT at 3900 (train view, no `shN`) versus 7.67 dB at
   step 0.
-- **Snapshot disk cost is the open worry.** 40 snapshots of this run are **399 MB** — ~10 MB each at
-  ~900k Gaussians, matching `snapshots.py`'s ~29 B/Gaussian. Phase 6 at `--data_factor` 1–2 with ~5M
-  Gaussians and 120 snapshots extrapolates to **~17 GB for one run**. Decide the Phase 6 cadence (or a
-  step-range window) before launching it, not after filling the disk.
+- **Snapshot disk cost — ⚠️ the earlier ~17 GB alarm was wrong.** It multiplied 120 frames by the
+  hardware profile's `max_gaussians` **cap** of 5M, which is a ceiling, not what a run reaches: the
+  Phase 1 baseline at `--data_factor 2` peaked at **1.57M**. Integrating the real growth curve at
+  25.7 B/Gaussian (measured on disk, not the ~29 previously quoted):
 
-**Phase 5 — Image-by-image curriculum**
-- **What to add:** `curriculum.py`, `append.py`, hooks 2 and 3, before/after renders, Δ maps, and ablation
-  mode.
-- **Check:** the report shows test PSNR vs. number of images plus a per-image improvement chart. The viewer
-  highlights each new frustum and the Gaussians it changed.
+  | cadence | frames | GB |
+  |---|---|---|
+  | every 250, whole run | 120 | **4.0** |
+  | every 500, whole run | 60 | 2.0 |
+  | every 250, stop at 15k + 4 late | 65 | 1.8 |
+
+  So **`--snapshot_every 250` for the whole run** is the Phase 6 setting, and no tapering machinery is
+  needed. If a `--data_factor 1` run roughly triples the population, that becomes ~13 GB, at which point
+  a `stop` parameter on `SnapshotWriter` (dense to `refine_stop_iter`, a few frames after) brings it back
+  under 6 GB — worth adding then, not now.
+
+**Phase 5 — Image-by-image curriculum — ✅ DONE**
+
+**Added:** `curriculum.py`, `append.py`, `stages.py`, `ablation.py`, `scripts/ablate.py`, hooks 2 and 3,
+before/after panels, per-Gaussian stage deltas, `curriculum.png`, viewer integration, and 129 tests
+(238 total). Verified end to end on `data/runs/dev-curriculum` and `data/runs/ablate-smoke`.
+
+- **Three modules, not the two the plan listed.** `curriculum.py` is pure numpy over index sets and point
+  masks — the ordering and the schedule, testable with a hand-built covisibility matrix. `stages.py` is
+  the trainer-facing half that needs torch, the optimizers and a renderer. The ordering decides what the
+  model ever sees, so it is worth being able to test without a GPU.
+- **`append_gaussians` keeps four things the same length**, and forgetting any one fails later and
+  elsewhere: the params, the Adam moments, the strategy's running state, and `GaussianScene`'s
+  `component_index`/`signal`. 1 and 2 go through gsplat's own `_update_param_with_optimizer` — the same
+  helper `ops.duplicate` uses — so the optimizer surgery is upstream's.
+- **The running state is zeroed, not copied. This is the one deliberate difference from
+  `ops.duplicate`.** A clone inherits its parent's `grad2d`/`count` because it genuinely has that
+  history; a seed has never been rendered. Copying accumulators in would make a brand-new Gaussian
+  eligible for cloning or splitting at the next refinement on borrowed evidence, before it has been seen
+  once. `ids` is the exception — identity, not history.
+- **`GaussianScene` has no "append fresh rows" hook.** Every callback it offers (`on_duplicate`,
+  `on_sample_add`) copies from existing rows, and `put()` is documented init-only because it rebuilds
+  the Parameters and would orphan the ones the optimizers hold. Route taken: `on_duplicate` with an index
+  vector pointing at row 0, which is exact — not approximate — while the scene has one component, and
+  that is asserted rather than assumed.
+- **Ordering, verified against brute force.** Start from the three images sharing the most 3D points
+  (`(0, 2, 16)` on `room-1`, 676 points in all three, matching an exhaustive search), then repeatedly add
+  whichever pending image shares the most points with the active *union*. Deterministic, ties to the
+  lowest index. Every train image once, no test image anywhere: a test image that helped choose the
+  curriculum is not a test image.
+- **⚠️ Found by a test assertion: numpy's `bool @ bool` is a *logical* matmul.** It answers "do these
+  share any point" where every ranking here needs "how many", returns a bool array, and `argmax` then
+  picks the first `True`. The order it produced was a plausible-looking permutation with a duplicated
+  image in it. The covisibility matrix is now cast to float32 for every counting matmul.
+- **Per-stage metrics reuse the trainer's own eval.** In curriculum mode the stage boundaries are merged
+  into `cfg.eval_steps`, so PSNR/SSIM/LPIPS on the held-out split come from the same code path the Phase 1
+  baseline used, and the curves are directly comparable. Landing on the boundary step (not boundary+1)
+  puts the eval on the **last step of the stage being measured**, before the next stage's seeds exist.
+- **The blind guess is rendered before seeding, and that order is not arbitrary.** Seed positions come
+  from the SfM solve, which saw every photo — so a seed already carries information from the new image,
+  and rendering after seeding would quietly turn the blind guess into a partially sighted one.
+- **The loader's prefetch blurs a boundary in one direction only.** 4 workers at the default prefetch of
+  2 draw ~8 indices ahead, but those come from the *previous* active set, so the new image cannot be
+  trained on before its boundary. The blind guess stays blind; the new image simply joins a few steps
+  late, which against 1,000-step stages is not worth removing the prefetch for.
+- **⚠️ A `def` inserted into the middle of `Runner.__init__` is valid Python.** The rest of `__init__`
+  becomes unreachable code in the new method's body; the file imports, and the run dies 1,100 lines later
+  with `AttributeError: 'Runner' object has no attribute '_gaussians_frozen'`. `tests/test_stages.py` now
+  AST-parses the vendored trainer and asserts the helper is a sibling of `__init__`, that `__init__`
+  still assigns everything it used to, that all four hook markers are present, and that
+  `create_splats_with_optimizers` still accepts `point_mask`. It doubles as the tripwire for an upstream
+  rename.
+- **Measured on `room-1`** (4k steps, `--data_factor 8`, warm-up 200, 100 steps/stage, 26 stages):
+  - starts from **1,492 of 6,762** SfM points — what three images can triangulate — against 6,762 for a
+    normal run;
+  - **4,114 points seeded** over 25 stages, **1,016 rejected as already covered** (~20%). The distance
+    filter discriminates rather than passing everything: stage 5 unlocked 38 points, seeded 2 — that photo
+    was looking at a region the model already had;
+  - every SfM point is unlocked by exactly one stage, and the total unlocked (6,622) equals what all 28
+    train images can triangulate. The 140 points seen by fewer than two train images are correctly never
+    seeded;
+  - **per-stage PSNR on the newly added view improved by +3.85 dB on average** (min +1.13, max +12.44),
+    positive at every one of the 25 stages. That number is the phase working: each photo is a poor guess
+    when first shown and measurably better by the end of its own stage.
+- **Schedule artifact to avoid in real runs.** With an explicit `--curriculum_stage_steps`, the last stage
+  absorbs whatever is left of `max_steps` — 1,400 steps against 100 in the run above, which is most of its
+  +12.44 dB. The default (`0`, divide what is left of `max_steps` evenly) has no such tail. Per-image
+  improvement is only comparable across equal-length stages.
+
+- **Per-Gaussian deltas are matched by id, not by row.** The driver snapshots the population at stage
+  start and diffs it at stage end into `deltas/stage_NNN.npz`, one row per Gaussian alive at both ends.
+  Densification appends, reorders and prunes on every refinement, so row *i* at the start of a stage and
+  row *i* at the end are unrelated Gaussians; diffing positionally produces a dense, plausible,
+  meaningless map of change. Four scalars, each readable on its own scale: movement in world units,
+  log-scale change (a relative size change), opacity in probability space, DC colour. `means` stays fp32
+  in the snapshot because fp16 near a scene scale of 1 resolves ~1e-3, the same order as the movement
+  being measured.
+- **The churn books balance, per stage.** Measured across all 26: `survived + died == before` and
+  `survived + born == after`, every time. Stage 0 reports 1,492 survivors and **zero** births and deaths
+  over its 200-step warm-up — an independent confirmation that densification really does not start until
+  `refine_start_iter`, arrived at from the id sets rather than from the strategy.
+- **The report (`curriculum.png`), three panels.** Held-out PSNR against image count, with Gaussians on a
+  log twin axis; per-photo improvement as blind-guess plus what its own stage added; and seeded vs
+  rejected-as-covered points per stage. The first panel carries a caption saying it conflates "more
+  images" with "more steps", because it does — only the ablation separates them.
+- **The stage/eval join has an off-by-one at exactly one stage.** The trainer evals at `step ==
+  eval_step - 1`, so a stage closed at a boundary is measured at `end_step - 1`; but the *last* stage is
+  closed at `max_steps - 1`, where the eval also lands. The join takes "the most recent eval at or before
+  this stage ended", which is right under both and survives a change of cadence. It also gives a free
+  cross-check: `stages.json`'s `n_gaussians_after` and the trainer's own `num_GS` are counted
+  independently and agree exactly at every stage.
+- **A warning that fires on a 1-step difference teaches the reader to ignore warnings.** Even division
+  of the remaining steps leaves a remainder, so the default schedule's stages differ by a step or two.
+  The "unequal stage lengths" note now needs a 25% spread before it appears.
+- **Viewer.** Frustums repaint by role as the timeline moves — active green, pending grey, the photo the
+  current stage just added orange, held-out blue throughout — reconstructed from the curriculum order
+  and the active count, so the viewer never needs the trainer's live state. Stage boundaries get
+  unlabelled slider ticks (26 labels would be a wall of text; the panel names the stage you are on). A
+  **changed by this stage** mode colours by movement, with Gaussians absent at either end of the stage
+  drawn near-black: "born during this stage" and "did not move" must not share a colour. And `seed`
+  green finally has a source — 1,095 of 158,828 Gaussians at step 2000.
+- **Ablation, and the number that decides whether to run it.** `scripts/ablate.py` trains each condition
+  on a fixed set of N images — the first N of the *same* ordering, so the conditions are nested — for the
+  same step count. `--repeats` is required and has no default, and `--plan` prints what a choice can
+  resolve before anything launches. On the Phase 3 spread of 0.708 dB: **32 runs per condition to
+  resolve 0.5 dB**, 8 for 1.0 dB, 126 for 0.25 dB. At 5 conditions that is 160 runs for half a decibel.
+  Deciding that is a judgement about how much the answer is worth, so it is left to the operator rather
+  than defaulted.
+- **Conditions the scene cannot run are dropped, not clamped.** `room-1` has 28 train images, so the
+  plan's N=40 is skipped with a note; silently running it *as* 28 would put one condition in the table
+  twice under two names.
+- **Smoke ablation** (`data/runs/ablate-smoke`, 1k steps, factor 8, n=2 — a driver test, not a result):
+  N=3 → 8.93 dB, N=10 → 15.99, N=28 → 17.92, pooled sd **0.925 dB**. The 3→10 step (+7.06 dB) clears the
+  2.59 dB resolvable at n=2; the 10→28 step (+1.94 dB) does not. Note the sd measured here is *larger*
+  than the Phase 3 prior, which is the carry-over note landing exactly as written: variance estimates
+  from a handful of chaotic runs are close to worthless.
+- **Check — ✅ passed.** `curriculum.png` shows held-out PSNR against image count and the per-photo
+  improvement chart; the viewer highlights each new frustum by role and colours the Gaussians each stage
+  changed.
+
+**Revision — the incremental curriculum was the wrong instrument, and now there are two.**
+
+The per-photo improvement numbers above were measured on a schedule that gave the first image **385**
+gradient steps and the last **5**. That was found by asking what expected exposure actually was rather
+than assuming uniform sampling made it uniform — it does not, because the pool grows.
+
+- **Proportional pacing is now the incremental default.** Stage length is `e · n_active` with `e` derived
+  from `max_steps` so the whole budget is used and no flag needs tuning. Measurement window: **1.00×**,
+  from 7.00×. Total spread falls from 60× to 26× — better, and still not fair, which is inherent.
+  `--curriculum_stage_steps` still gives the old constant-length pacing for reproducing earlier runs.
+- **`--curriculum_mode groups`** partitions the ordering into `--curriculum_group_size` groups and visits
+  them round-robin for `--curriculum_rounds` passes. Every image gets `rounds × e` steps — **exposure
+  spread 1.00×, verified on the real scene**. A short tail group is folded into its predecessor, because
+  a group of 1 getting a full visit's steps is the exact inequality the mode removes.
+- **Only a first visit introduces images**, so a revisit records no blind guess rather than claiming one.
+- **Measured side by side, same 4k-step budget at factor 8:**
+
+  | run | mode | exposure spread | final PSNR | Gaussians | per-photo mean |
+  |---|---|---|---|---|---|
+  | `dev-curriculum` | incremental | 31.97× | 17.397 | 758,045 | +4.78 dB over 25 |
+  | `dev-groups` | groups (4×4) | **1.00×** | 17.592 | 351,174 | +5.41 dB over 7 |
+
+  Groups reached marginally higher PSNR with under half the Gaussians. **n = 1 per mode, so that is not a
+  result** — it is a note that the fair schedule did not cost anything obvious, which is the only claim
+  one run supports.
+- **⚠️ Found while reading the groups report: an eval 2 steps after an opacity reset read 5.74 dB**
+  against 16.87 before and 17.14 after. An 11 dB hole that is entirely the documented reset dip, and
+  would read as a catastrophic regression to anyone who did not know. It appeared in groups mode only
+  because its stage boundaries happened to land there. The report now rings any eval within 200 steps
+  after a reset and says why; the underlying deaths confirm it — 33,296 pruned at step 3100 against
+  6,805 at 3000.
+- **The viewer gained a `resting` role** for groups mode: seen and seeded but not currently receiving
+  gradient. Dark green rather than grey, because "seen and seeded" is much closer to active than to
+  never-seen and grey would read as "not in this run".
+- **What this means for the ablation.** Groups mode answers "what does each image contribute at equal
+  exposure" directly, which was most of what the ablation was for. `scripts/ablate.py` is still the tool
+  for the *fixed-budget* question ("how should I spend N steps"), and that is a different question —
+  worth running only if it is one you have.
 
 **Phase 6 — Your room at full quality on the 5090**
 - **Train:** run the full-resolution incremental run followed by a standard 30k run.
@@ -437,15 +636,18 @@ Everything now runs on one machine: the native Ubuntu 5090 desktop. The WSL2 / W
 | 2 capture + SfM | ✅ done | `data/scenes/room-1/`, 32/32 registered, 0.93 px |
 | 3 instrumentation | ✅ done | lineage/events/snapshots/report + hooks 1 & 4; neutrality established |
 | 4 playback viewer | ✅ done | `timeline.py`/`viewer.py`/`view.py`; verified on `dev-room-4k`, 108 tests |
-| 5 curriculum | ⬅️ **next** | develop at `--data_factor 8`, few images, then scale up |
+| 5 curriculum | ✅ done | two modes: incremental (narrative) + groups (fair exposure); 262 tests |
 | 6 full-quality room run | todo | `--data_factor 1` or 2; the payoff |
 
 **Immediate plan:**
 
-1. **Phase 5** — `curriculum.py`, `append.py`, hooks 2 and 3. The viewer's frustum roles already have
-   `pending` (grey) and `added` (orange) wired in with nowhere to come from yet; the curriculum is what
-   fills them, and `ORIGIN_COLORS` already reserves green for the `seed` births `append.py` will log.
-2. **Phase 6** after it — but settle the snapshot cadence first (see Phase 4's disk note).
+1. **Phase 6** — the full-quality room run. Two things to settle before launching it:
+   - the **snapshot cadence** — settled: `--snapshot_every 250`, measured at 4.0 GB (see Phase 4);
+   - whether to spend the **ablation** at all. Groups mode now answers "what does each image contribute
+     at equal exposure" directly, which was most of its purpose; `ablate.py` remains for the
+     fixed-budget question. `--plan` prints the cost: 0.5 dB needs 32 runs per condition.
+2. `scripts/train.py` and the `configs/` tree are still unwritten; the trainer is driven directly. Worth
+   doing before Phase 6 if only to stop the long flag lists from being retyped.
 
 **Carry into Phase 5.** The ablation ("N ∈ {3, 5, 10, 20, 40, all} images at equal iteration counts") is
 one run per condition, in the same chaotic mid-densification regime measured above. A 0.5 dB effect there
@@ -474,22 +676,46 @@ is **inside run-to-run noise**. Decide the repeat count before running it, not a
 | **Thin SfM seed (6,762 points, track length 3.58)** | densification carries it; if the result is poor, shoot more photos before touching hyperparameters — 32 is the low end of the target |
 | Textureless walls → weak SfM | capture protocol; hloc SuperPoint+LightGlue as a fallback matcher |
 | Exposure drift / mirrors / screens | lock exposure; view-dependent artifacts accepted |
-| Snapshot disk usage | fp16 light snapshots (~28 MB per 1M Gaussians); `data/` is on the local ext4 disk; `DATA_ROOT` moves it if that fills |
+| Snapshot disk usage | fp16 light snapshots, **25.7 bytes/Gaussian on disk** (32 uncompressed) — measured, not estimated. A 30k run at `--snapshot_every 250` integrates to **4.0 GB** on the Phase 1 baseline's growth curve. `data/` is on the local ext4 disk; `DATA_ROOT` moves it if that fills |
 | Data now lives inside the repo | `.gitignore` excludes `data/`, `photos/`, `*.ply`, `*.bin`, `*.parquet`, `*.db` — check `git status` stays clean after a training run |
 
 ---
 
 ## Verification
 
-- **Unit tests:** `.venv/bin/python -m pytest tests/` (108 passing).
+- **Unit tests:** `.venv/bin/python -m pytest tests/` (262 passing).
   - **Lineage:** runs the **real** gsplat grow/prune ops on a tiny synthetic param set — never a mock,
     since what is being tested is our reading of gsplat's internal layout. Covers unique ids, correct
     parents for clones and splits, the child-major ordering, split parents recorded as deaths so
     births − deaths equals the population, exact prune ids, ids never reused, and the byte-identical
     equivalence with `DefaultStrategy` described in Phase 3.
-  - **Append:** params, Adam state and every `state` tensor keep the same length, and an optimizer step
-    after append succeeds.
-  - **Curriculum:** image ordering and seed-point filtering.
+  - **Append:** driven against the real `ops` helper, the real Adam, the real `GaussianScene` and the
+    real `InstrumentedStrategy` — never a mock, since what is tested is our reading of gsplat's internal
+    bookkeeping. Params, Adam moments, every `state` tensor and the scene's side arrays grow together; an
+    optimizer step after append succeeds; new rows start with zero moments and zero accumulators while
+    the originals keep theirs; ids come from the strategy's one counter; a following real densification
+    keeps everything aligned. Refusals: a missing param, a wrong trailing shape, `ids` without `new_ids`,
+    a multi-component scene, a cloud smaller than `knn`'s k.
+  - **Curriculum:** a hand-built covisibility matrix where every answer is countable by eye. Pair counts
+    that count rather than test for overlap, the best triple against brute force on 20 random matrices,
+    growth from the active union, lowest-index tie-breaking, the two-view floor for triangulation, seed
+    masks partitioning the unlocked points, the schedule (warm-up, even division, explicit override, a
+    run too short for its stages), and `on_step` firing every stage exactly once without skipping.
+  - **Stages:** the sampler draws only from active images, picks up an advance, never stops, and covers
+    the active set evenly rather than sampling with replacement; stage 0 is recorded; records carry the
+    photo, the population change and both PSNRs; the panel is five views wide; `finish` closes the last
+    stage. Deltas: matched by id and not by row (a stage whose survivors are reordered reports zero
+    movement), the churn identities, movement in world units (a 3-4-5 displacement reads as 5), opacity
+    in probability space, one npz row per survivor, and the degradations — no survivors, and no `ids` at
+    all on a run without `--lineage`. Plus the AST check on the vendored trainer patch.
+  - **Report:** the stage/eval join under both conventions, the independent population cross-check, a
+    stage with no eval, and that the join does not mutate what it read. Plus the shared image helpers,
+    including that a shared `vmax` is what keeps a before/after error pair comparable.
+  - **Ablation:** the power arithmetic against its closed form (`n=16` at σ=Δ; four times the variance
+    is four times the runs; twice the effect is a quarter of them), that `effect_at_n` inverts
+    `n_for_effect`, that the Phase 3 spread needs 32 runs for 0.5 dB, conditions deduped and dropped
+    rather than clamped, collection ignoring unfinished runs, a sample sd with `ddof=1`, and a pooled sd
+    weighted by degrees of freedom that ignores single-run conditions.
   - **Snapshots:** save/load round-trip, `shN` excluded, ids taken from `state` rather than row position
     (after densification they are not `arange`, and colouring by lineage depends on the real ones).
   - **Events:** schema and dtypes survive parquet, empty batches write nothing, bad input is rejected,

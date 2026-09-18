@@ -23,7 +23,7 @@ import time
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union  # [splat] Any
 
 import imageio
 import numpy as np
@@ -78,9 +78,11 @@ from nerfview import CameraState, RenderTabState, apply_float_colormap
 
 # [splat] the repo root, so `splat` is importable when this file is run directly
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from splat.curriculum import Covisibility, Curriculum, CurriculumConfig, point_spacing  # noqa: E402
 from splat.events import EventLog  # noqa: E402
 from splat.lineage import InstrumentedStrategy  # noqa: E402
 from splat.snapshots import SnapshotWriter  # noqa: E402
+from splat.stages import StageDriver  # noqa: E402
 
 
 @dataclass
@@ -190,6 +192,39 @@ class Config:
     lineage: bool = False
     # [splat] Write a light fp16 snapshot every N steps (0 disables).
     snapshot_every: int = 0
+    # [splat] Phase 5: show the training images one at a time instead of all of
+    # them from step 0. Requires --lineage, since a seed Gaussian's provenance
+    # is the whole point of the mode.
+    curriculum: bool = False
+    # [splat] "incremental" accumulates images one at a time (the narrative
+    # mode: it is what makes a blind-guess render possible). "groups" visits
+    # disjoint groups round-robin so every image gets identical exposure (the
+    # measurement mode). See splat/curriculum.py on why both exist.
+    curriculum_mode: str = "incremental"
+    # [splat] how many images the run starts from (incremental)
+    curriculum_init_images: int = 3
+    # [splat] incremental: gradient steps each active image gets per stage, so
+    # stage length scales with the active count. 0 derives it from max_steps.
+    curriculum_steps_per_image: int = 0
+    # [splat] groups: images per group, and round-robin passes over them
+    curriculum_group_size: int = 4
+    curriculum_rounds: int = 4
+    # [splat] cap on how many images the run ever sees; 0 means all. Setting it
+    # equal to curriculum_init_images gives the ablation condition: a fixed
+    # image count for a full-length run.
+    curriculum_max_images: int = 0
+    # [splat] steps on the initial images before the first one is added
+    curriculum_warmup: int = 500
+    # [splat] steps per added image; 0 divides what is left of max_steps evenly
+    curriculum_stage_steps: int = 0
+    # [splat] a seed must be this many multiples of the SfM cloud's typical
+    # point spacing from every existing Gaussian; 0 disables the check
+    curriculum_min_spacing: float = 1.0
+    # [splat] cap on seeds per stage, so one wide-angle photo cannot inject millions
+    curriculum_max_seeds: int = 200_000
+    # [splat] run the held-out eval at every stage boundary, for the report's
+    # "test PSNR vs number of images" curve
+    curriculum_eval_stages: bool = True
     strategy: Union[DefaultStrategy, MCMCStrategy] = field(
         default_factory=DefaultStrategy
     )
@@ -321,10 +356,18 @@ def create_splats_with_optimizers(
     device: str = "cuda",
     world_rank: int = 0,
     world_size: int = 1,
+    point_mask: Optional[np.ndarray] = None,  # [splat]
 ) -> Tuple[torch.nn.ParameterDict, Dict[str, torch.optim.Optimizer]]:
     if init_type == "sfm" or init_type == "lidar":
         points = torch.from_numpy(parser.points).float()
         rgbs = torch.from_numpy(parser.points_rgb / 255.0).float()
+        # [splat] hook 2: start from only the points the initial curriculum
+        # images can triangulate. Applied before the knn below on purpose --
+        # a Gaussian's initial size should reflect the density of the cloud the
+        # model actually has, not of one it has not been shown yet.
+        if point_mask is not None:
+            keep = torch.from_numpy(np.asarray(point_mask, dtype=bool))
+            points, rgbs = points[keep], rgbs[keep]
     elif init_type == "random":
         points = init_extent * scene_scale * (torch.rand((init_num_pts, 3)) * 2 - 1)
         rgbs = torch.rand((init_num_pts, 3))
@@ -487,6 +530,59 @@ class Runner:
                 f"but world_size={world_size}."
             )
 
+        # [splat] hook 2: the curriculum, and the point subset it starts from.
+        # Built before the model because it decides what the model starts as.
+        self.curriculum = None
+        self.stage_driver = None
+        point_mask = None
+        if cfg.curriculum:
+            if cfg.data_type != "colmap":
+                raise ValueError("--curriculum needs a COLMAP scene, not " + cfg.data_type)
+            if not cfg.lineage:
+                raise ValueError("--curriculum requires --lineage: seed provenance is the point")
+            covis = Covisibility.from_parser(self.parser, self.trainset.indices)
+            self.curriculum = Curriculum(
+                covis,
+                max_steps=cfg.max_steps,
+                cfg=CurriculumConfig(
+                    mode=cfg.curriculum_mode,
+                    init_images=cfg.curriculum_init_images,
+                    max_images=cfg.curriculum_max_images,
+                    steps_per_image=cfg.curriculum_steps_per_image,
+                    group_size=cfg.curriculum_group_size,
+                    rounds=cfg.curriculum_rounds,
+                    warmup_steps=cfg.curriculum_warmup,
+                    stage_steps=cfg.curriculum_stage_steps,
+                    min_spacing=cfg.curriculum_min_spacing,
+                    max_seeds_per_stage=cfg.curriculum_max_seeds,
+                ),
+            )
+            point_mask = self.curriculum.initial_mask()
+            spread = self.curriculum.exposure_spread()
+            print(
+                f"[splat] curriculum ({cfg.curriculum_mode}):"
+                f" {len(self.curriculum.stages)} stages over"
+                f" {len(self.curriculum.images)} of {len(self.trainset)} train images,"
+                f" ~{self.curriculum.steps_per_image:.0f} steps per active image per"
+                f" stage; starting from {int(point_mask.sum())}/"
+                f"{len(self.parser.points)} SfM points"
+            )
+            print(
+                f"[splat] per-image exposure spread {spread:.2f}x"
+                + ("  (equal by construction)" if spread < 1.01 else
+                   "  -- inherent to incremental; use --curriculum_mode groups"
+                   " for a fair per-image comparison")
+            )
+            if cfg.curriculum_eval_stages:
+                # Reuse the trainer's own eval so the per-stage PSNR/SSIM/LPIPS
+                # come from the same code path the baseline used.
+                # the boundary itself, not boundary+1: the trainer evals at
+                # `step == i - 1`, so this lands on the LAST step of the stage
+                # being measured, before the next stage's seeds are injected
+                cfg.eval_steps = sorted(
+                    set(list(cfg.eval_steps) + list(self.curriculum.boundaries))
+                )
+
         # Model
         feature_dim = 32 if cfg.app_opt else None
         self.splats, self.optimizers = create_splats_with_optimizers(
@@ -511,6 +607,7 @@ class Runner:
             device=self.device,
             world_rank=world_rank,
             world_size=world_size,
+            point_mask=point_mask,  # [splat]
         )
         self.scene = GaussianScene.from_splats(self.splats, id="scene")
         self.splats = self.scene.splats
@@ -551,6 +648,27 @@ class Runner:
             self.strategy_state = self.cfg.strategy.initialize_state()
         else:
             assert_never(self.cfg.strategy)
+
+        # [splat] hook 3: everything that happens at a curriculum stage
+        # boundary lives in StageDriver, so this stays one object and one call
+        # in the loop below.
+        if self.curriculum is not None:
+            self.stage_driver = StageDriver(
+                plan=self.curriculum,
+                trainset=self.trainset,
+                parser=self.parser,
+                out_dir=Path(cfg.result_dir),
+                render_fn=self._render_train_view,
+                strategy=self.cfg.strategy,
+                events=self.events,
+                device=self.device,
+                sh_degree=cfg.sh_degree,
+                min_spacing_units=cfg.curriculum_min_spacing,
+                spacing=point_spacing(self.parser.points),
+                max_seeds=cfg.curriculum_max_seeds,
+                init_opacity=cfg.init_opa,
+                init_scale=cfg.init_scale,
+            )
 
         # Compression Strategy
         self.compression_method = None
@@ -681,6 +799,32 @@ class Runner:
 
         self._gaussians_frozen = True
         print("[Distillation] Gaussian parameters frozen")
+
+    # [splat] render one trainset item from the current model, for the
+    # curriculum's before/after panels. Kept next to eval()'s call so the two
+    # stay the same render.
+    @torch.no_grad()
+    def _render_train_view(self, data: Dict[str, Any]) -> Tensor:
+        cfg = self.cfg
+        pixels = data["image"]
+        height, width = pixels.shape[0:2]
+        colors, _, _ = self.stage.render(
+            self.scene.id,
+            camtoworlds=data["camtoworld"][None].to(self.device),
+            Ks=data["K"][None].to(self.device),
+            width=width,
+            height=height,
+            sh_degree=cfg.sh_degree,
+            near_plane=cfg.near_plane,
+            far_plane=cfg.far_plane,
+            masks=None,
+            frame_idcs=None,
+            camera_idcs=torch.tensor([data["camera_idx"]], device=self.device),
+            exposure=(
+                data["exposure"][None].to(self.device) if "exposure" in data else None
+            ),
+        )
+        return torch.clamp(colors, 0.0, 1.0)
 
     def rasterize_splats(
         self,
@@ -883,12 +1027,22 @@ class Runner:
         trainloader = torch.utils.data.DataLoader(
             self.trainset,
             batch_size=cfg.batch_size,
-            shuffle=True,
+            # [splat] hook 3: in curriculum mode an infinite sampler over the
+            # active images replaces shuffle. See splat/stages.py on why the
+            # loader's prefetch cannot leak the new image in early.
+            shuffle=self.stage_driver is None,
+            sampler=None if self.stage_driver is None else self.stage_driver.sampler(),
             num_workers=4,
             persistent_workers=True,
             pin_memory=True,
         )
         trainloader_iter = iter(trainloader)
+
+        # [splat] hook 3: open stage 0 before the loop. No boundary fires at
+        # step 0, so without this the warm-up is the one stage whose effect on
+        # the population goes unmeasured.
+        if self.stage_driver is not None:
+            self.stage_driver.begin(init_step, self.splats, self.strategy_state)
 
         # Training loop.
         global_tic = time.time()
@@ -908,6 +1062,17 @@ class Runner:
                 and step >= cfg.ppisp_controller_activation_num_steps
             ):
                 self.freeze_gaussians()
+
+            # [splat] hook 3: advance before this step's batch, so the blind
+            # guess is rendered against a model that has never seen the image.
+            if self.stage_driver is not None:
+                self.stage_driver.on_step(
+                    step,
+                    self.splats,
+                    self.optimizers,
+                    self.strategy_state,
+                    scene=self.scene,
+                )
 
             try:
                 data = next(trainloader_iter)
@@ -1214,6 +1379,12 @@ class Runner:
             # [splat] hook 4: snapshot after the population has settled for this
             # step, so the file matches the counts the strategy just reported.
             self.snapshots.maybe_save(step, self.splats, self.strategy_state)
+            if self.stage_driver is not None and step == max_steps - 1:
+                # closes the open stage (its after-render) and writes stages.json
+                print(
+                    "[splat]",
+                    self.stage_driver.finish(step, self.splats, self.strategy_state),
+                )
             if self.events is not None and step == max_steps - 1:
                 self.events.flush()
 

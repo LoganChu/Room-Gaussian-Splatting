@@ -17,6 +17,12 @@ Two inputs, both written by an instrumented run:
 The snapshot says *which* Gaussians were alive; only the event log says *why*.
 They meet on ``ids``, which is why snapshots carry the id array at all.
 
+A curriculum run adds two more, and they meet the others on ids as well:
+
+- ``stages.json`` -- which photo was added when, and what it did.
+- ``deltas/stage_NNN.npz`` -- per-Gaussian change over each stage, which is what
+  "the Gaussians this photo changed" means once it is a picture.
+
 Memory
 ------
 The lineage index is dense arrays indexed by gid: 13 bytes per id ever issued,
@@ -31,7 +37,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, NamedTuple, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -83,6 +89,83 @@ def load_cfg(run: RunPaths) -> Dict:
         return {}
     with open(path) as f:
         return yaml.load(f, Loader=_Loader) or {}
+
+
+class ImageRoles(NamedTuple):
+    """What each training image is doing at one step."""
+
+    active: List[int]  #: the sampler is drawing from these
+    resting: List[int]  #: seen and seeded, but not training right now
+    pending: List[int]  #: never seen
+    added: Optional[int]  #: first seen at this stage, if any
+
+
+def load_stages(run: RunPaths) -> Optional[Dict]:
+    """``stages.json``, or None for a run that was not a curriculum run."""
+    import json
+
+    path = Path(run.root) / "stages.json"
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text())
+    except json.JSONDecodeError:
+        # A run killed mid-write leaves a truncated file. Losing the stage
+        # markers is survivable; refusing to open the viewer is not.
+        return None
+
+
+@dataclass(frozen=True)
+class StageInfo:
+    """One curriculum stage, as ``stages.json`` recorded it."""
+
+    index: int
+    step: int
+    end_step: Optional[int]
+    added: Optional[int]  #: dataset item index of the photo added
+    image: Optional[str]
+    n_images: int  #: images seen so far
+    active: Tuple[int, ...] = ()  #: items the sampler drew from during this stage
+    n_active: int = 0
+    steps_per_active_image: float = 0.0
+    group: Optional[int] = None
+    round: Optional[int] = None
+    n_seeded: int = 0
+    n_survived: int = 0
+    n_born: int = 0
+    n_died: int = 0
+    psnr_before: Optional[float] = None
+    psnr_after: Optional[float] = None
+    deltas: Optional[str] = None
+
+    @classmethod
+    def from_record(cls, rec: Dict) -> "StageInfo":
+        return cls(
+            index=int(rec["stage"]),
+            step=int(rec["step"]),
+            end_step=rec.get("end_step"),
+            added=rec.get("added"),
+            image=rec.get("image"),
+            n_images=int(rec.get("n_images", 0)),
+            active=tuple(rec.get("active") or ()),
+            n_active=int(rec.get("n_active", 0) or 0),
+            steps_per_active_image=float(rec.get("steps_per_active_image", 0) or 0),
+            group=rec.get("group"),
+            round=rec.get("round"),
+            n_seeded=int(rec.get("n_seeded", 0) or 0),
+            n_survived=int(rec.get("n_survived", 0) or 0),
+            n_born=int(rec.get("n_born", 0) or 0),
+            n_died=int(rec.get("n_died", 0) or 0),
+            psnr_before=rec.get("psnr_before"),
+            psnr_after=rec.get("psnr_after"),
+            deltas=rec.get("deltas"),
+        )
+
+    @property
+    def gain(self) -> Optional[float]:
+        if self.psnr_before is None or self.psnr_after is None:
+            return None
+        return self.psnr_after - self.psnr_before
 
 
 @dataclass(frozen=True)
@@ -140,12 +223,19 @@ class Lineage:
         parent: np.ndarray,
         death_step: np.ndarray,
         resets: np.ndarray,
+        stage_steps: np.ndarray = None,  # type: ignore[assignment]
     ) -> None:
         self.birth_step = birth_step  # int32[n_ids], -1 if never born (a gap)
         self.birth_kind = birth_kind  # int8[n_ids], index into BIRTH_KINDS, -1 unknown
         self.parent = parent  # int32[n_ids], -1 for sfm/seed
         self.death_step = death_step  # int32[n_ids], -1 if still alive at the end
         self.resets = resets  # int32[n_resets], the opacity-reset steps
+        #: int32[n_stages], the curriculum stage-boundary steps. Read from the
+        #: event log rather than stages.json so the markers survive a run whose
+        #: stages.json was never written (a crash, or a copy of just the log).
+        self.stage_steps = (
+            np.empty(0, dtype=np.int32) if stage_steps is None else stage_steps
+        )
         self._child_parent: Optional[np.ndarray] = None
         self._child_gid: Optional[np.ndarray] = None
 
@@ -174,6 +264,7 @@ class Lineage:
         is_birth = np.isin(kind, BIRTH_KINDS)
         is_death = kind == "death"
         resets = np.unique(step[kind == "reset"]).astype(np.int32)
+        stages = np.unique(step[kind == "stage"]).astype(np.int32)
 
         n = int(gid[is_birth].max()) + 1 if is_birth.any() else 0
         birth_step = np.full(n, _NONE, dtype=np.int32)
@@ -195,7 +286,7 @@ class Lineage:
         in_range = (dgid >= 0) & (dgid < n)
         death_step[dgid[in_range]] = step[is_death][in_range]
 
-        return cls(birth_step, birth_kind, parents, death_step, resets)
+        return cls(birth_step, birth_kind, parents, death_step, resets, stages)
 
     @classmethod
     def load(cls, run: RunPaths) -> Optional["Lineage"]:
@@ -338,6 +429,13 @@ class Timeline:
         self.cfg = load_cfg(run)
         self.schedule = Schedule.from_cfg(self.cfg)
         self._per_step: Optional[Dict[str, Tuple[np.ndarray, np.ndarray]]] = None
+        self.plan = load_stages(run)
+        self.stages: List[StageInfo] = (
+            [StageInfo.from_record(r) for r in self.plan.get("stages", [])]
+            if self.plan
+            else []
+        )
+        self._deltas: Dict[int, Optional[Dict[str, np.ndarray]]] = {}
 
     # -- steps -------------------------------------------------------------
 
@@ -386,6 +484,64 @@ class Timeline:
     @property
     def resets(self) -> np.ndarray:
         return self.lineage.resets if self.lineage else np.empty(0, dtype=np.int32)
+
+    @property
+    def is_curriculum(self) -> bool:
+        return bool(self.stages)
+
+    @property
+    def stage_steps(self) -> np.ndarray:
+        """Stage-boundary steps, from stages.json or failing that the event log."""
+        if self.stages:
+            return np.asarray([s.step for s in self.stages[1:]], dtype=np.int32)
+        return self.lineage.stage_steps if self.lineage else np.empty(0, dtype=np.int32)
+
+    @property
+    def order(self) -> List[int]:
+        """The curriculum order, as dataset item indices."""
+        return list(self.plan.get("order", [])) if self.plan else []
+
+    def stage_at(self, step: int) -> Optional[StageInfo]:
+        """The curriculum stage in force at ``step``, or None."""
+        out = None
+        for stage in self.stages:
+            if stage.step <= step:
+                out = stage
+            else:
+                break
+        return out
+
+    def active_images(self, step: int) -> "ImageRoles":
+        """Which images are doing what at ``step``, as dataset item indices.
+
+        In incremental mode the active set is a prefix of the curriculum order,
+        so the image count alone would reconstruct it. In groups mode it is one
+        group and everything else already seen is *resting* -- seen, seeded, and
+        not currently receiving gradient. That distinction is the point of the
+        mode, so the active set is read from the record rather than inferred.
+        """
+        order = self.order
+        stage = self.stage_at(step)
+        if not order or stage is None:
+            return ImageRoles(list(order), [], [], None)
+        seen = order[: stage.n_images]
+        active = list(stage.active) if stage.active else seen
+        resting = [i for i in seen if i not in set(active)]
+        return ImageRoles(active, resting, order[stage.n_images :], stage.added)
+
+    def deltas(self, stage_index: int) -> Optional[Dict[str, np.ndarray]]:
+        """Per-Gaussian change over one stage, or None if it was not recorded."""
+        if stage_index in self._deltas:
+            return self._deltas[stage_index]
+        out = None
+        match = [s for s in self.stages if s.index == stage_index and s.deltas]
+        if match:
+            path = self.run.root / match[0].deltas
+            if path.exists():
+                with np.load(path) as z:
+                    out = {k: z[k] for k in z.files}
+        self._deltas[stage_index] = out
+        return out
 
     @property
     def densify_steps(self) -> np.ndarray:
@@ -439,6 +595,33 @@ class Timeline:
                 " and opacities still move."
             )
         lines.append(f"SH degree {s.sh_degree_at(step)} of {s.sh_degree}")
+
+        stage = self.stage_at(step)
+        if stage is not None:
+            roles = self.active_images(step)
+            head = f"stage {stage.index}: {stage.n_images} images seen"
+            if stage.group is not None:
+                head += f", training group {stage.group} (round {stage.round})"
+            if stage.image:
+                head += f", just added {stage.image}"
+            lines.append(head)
+            if stage.n_active and stage.n_active != stage.n_images:
+                lines.append(
+                    f"{stage.n_active} active now, {len(roles.resting)} resting"
+                )
+            if roles.pending:
+                lines.append(f"{len(roles.pending)} photos still pending")
+            if stage.steps_per_active_image:
+                lines.append(
+                    f"{stage.steps_per_active_image:.0f} steps per active image this stage"
+                )
+            if stage.n_seeded:
+                lines.append(f"{stage.n_seeded:,} Gaussians seeded from newly triangulable points")
+            if stage.gain is not None:
+                lines.append(
+                    f"that view: {stage.psnr_before:.2f} dB blind -> "
+                    f"{stage.psnr_after:.2f} dB ({stage.gain:+.2f})"
+                )
 
         if ids is not None:
             lines.append(f"{ids.size:,} Gaussians")
@@ -495,3 +678,41 @@ def colors_by_age(
 def highlight(ids: np.ndarray, selected: Sequence[int]) -> np.ndarray:
     """Boolean mask over ``ids`` for the members of ``selected`` still alive."""
     return np.isin(np.asarray(ids), np.asarray(selected, dtype=np.int64))
+
+
+def colors_by_delta(
+    ids: np.ndarray,
+    deltas: Dict[str, np.ndarray],
+    field: str = "d_means",
+    colormap: str = "inferno",
+    unchanged: Tuple[float, float, float] = (0.15, 0.16, 0.18),
+) -> np.ndarray:
+    """float32[N, 3] by how much each Gaussian changed over a stage.
+
+    Gaussians that were not alive at both ends of the stage are drawn near-black
+    rather than at the bottom of the ramp: "born during this stage" and "did not
+    move" are completely different statements, and a shared colour would merge
+    them.
+
+    Normalised to the 99th percentile, not the maximum. One Gaussian that flew
+    across the room -- and there always is one -- would otherwise compress every
+    real change into the first percent of the ramp.
+    """
+    from matplotlib import colormaps
+
+    out = np.tile(np.asarray(unchanged, dtype=np.float32), (len(ids), 1))
+    values = deltas.get(field)
+    if values is None or len(deltas.get("ids", ())) == 0:
+        return out
+    order = np.argsort(deltas["ids"])
+    keys = deltas["ids"][order]
+    pos = np.searchsorted(keys, ids)
+    pos = np.clip(pos, 0, keys.size - 1)
+    hit = keys[pos] == ids
+    if not hit.any():
+        return out
+    v = np.asarray(values, dtype=np.float32)[order][pos[hit]]
+    hi = float(np.percentile(np.asarray(values, dtype=np.float32), 99))
+    t = np.clip(v / max(hi, 1e-9), 0.0, 1.0)
+    out[hit] = colormaps[colormap](t)[:, :3].astype(np.float32)
+    return out

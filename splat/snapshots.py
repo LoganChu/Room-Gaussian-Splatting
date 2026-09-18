@@ -5,9 +5,15 @@ to draw the scene and colour it by lineage -- position, shape, orientation,
 opacity, base colour, and id -- in fp16, and drops the optimizer state and the
 higher-order spherical harmonics that dominate a real checkpoint's size.
 
-Cost: ~29 bytes per Gaussian, so ~29 MB per million. A 30k run snapshotting
-every 250 steps holds 120 of them, which is why the higher-order SH have to go:
-keeping shN would multiply that by about eight.
+Cost, measured on a real 895k-Gaussian frame: **32 bytes per Gaussian**
+uncompressed (means 6, scales 6, quats 8, opacities 2, sh0 6, ids 4), **25.7 on
+disk** after npz deflate. A 30k run snapshotting every 250 steps holds 120 of
+them; on the Phase 1 baseline, which grows to 1.57M Gaussians, that integrates
+to **4.0 GB** -- well under the naive "final count x 120" of 4.9 GB, because the
+population is below its final value for most of the run.
+
+Keeping shN would add 90 bytes per Gaussian in fp16 (15 bands x 3 channels),
+nearly 4x everything else combined, which is why it goes.
 
 Positions in fp16 carry ~3 decimal digits, which is ample against a scene scale
 of order 1 and is display precision, not training precision. Nothing is ever

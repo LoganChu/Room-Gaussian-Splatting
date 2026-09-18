@@ -140,6 +140,37 @@ class InstrumentedStrategy(DefaultStrategy):
                 self.events.add(step, "death", child_parents[:n_split].cpu().numpy())
         return n_dupli, n_split
 
+    # -- seeds (Phase 5) ---------------------------------------------------
+
+    @torch.no_grad()
+    def append_seeds(
+        self,
+        params,
+        optimizers: Dict[str, torch.optim.Optimizer],
+        state: Dict[str, Any],
+        new: Dict[str, torch.Tensor],
+        step: int,
+        scene=None,
+    ) -> torch.Tensor:
+        """Inject curriculum seed Gaussians and return their fresh ids.
+
+        Lives here rather than in ``append.py`` because ``_next_id`` does: ids
+        must come from one counter or two Gaussians share one, and a shared id
+        silently merges two lineages into a plausible single history. The actual
+        tensor surgery is ``append.append_gaussians``.
+        """
+        from .append import append_gaussians
+
+        self._ensure_ids(params, state, step)
+        n = int(new["means"].shape[0])
+        if n == 0:
+            return state["ids"][:0]
+        ids = self._fresh(n, state["ids"])
+        append_gaussians(params, optimizers, state, new, scene=scene, new_ids=ids)
+        if self.events is not None:
+            self.events.add(step, "seed", ids.cpu().numpy())
+        return ids
+
     @torch.no_grad()
     def _prune_gs(
         self, params, optimizers, state: Dict[str, Any], step: int, scene=None

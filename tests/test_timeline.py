@@ -321,3 +321,205 @@ def test_an_empty_run_reports_rather_than_guesses(tmp_path):
     assert t.steps == []
     with pytest.raises(ValueError, match="no snapshots"):
         t.nearest(0)
+
+
+# -- curriculum stages -----------------------------------------------------
+
+
+STAGES_JSON = {
+    "order": [4, 0, 7, 2, 5],
+    "warmup_steps": 100,
+    "stage_steps": 100,
+    "stages": [
+        {"stage": 0, "step": 0, "end_step": 100, "added": None, "image": None,
+         "n_images": 3, "n_points_unlocked": 40, "n_seeded": 0,
+         "n_survived": 40, "n_born": 0, "n_died": 0},
+        {"stage": 1, "step": 100, "end_step": 200, "added": 2, "image": "IMG_0002.jpeg",
+         "n_images": 4, "n_points_unlocked": 12, "n_seeded": 9,
+         "n_survived": 38, "n_born": 20, "n_died": 2,
+         "psnr_before": 10.0, "psnr_after": 14.5, "deltas": "deltas/stage_001.npz"},
+        {"stage": 2, "step": 200, "end_step": 300, "added": 5, "image": "IMG_0005.jpeg",
+         "n_images": 5, "n_points_unlocked": 5, "n_seeded": 4,
+         "n_survived": 50, "n_born": 6, "n_died": 4,
+         "psnr_before": 12.0, "psnr_after": 13.0},
+    ],
+}
+
+
+@pytest.fixture
+def curriculum_run(run) -> RunPaths:
+    """The synthetic run, with a curriculum record and one delta file."""
+    import json
+
+    (run.root / "stages.json").write_text(json.dumps(STAGES_JSON))
+    deltas = run.root / "deltas"
+    deltas.mkdir(exist_ok=True)
+    np.savez_compressed(
+        deltas / "stage_001.npz",
+        stage=np.int32(1),
+        ids=np.array([3, 0, 8], dtype=np.int32),
+        d_means=np.array([0.5, 0.0, 10.0], dtype=np.float16),
+    )
+    return run
+
+
+def test_a_run_without_stages_json_is_not_a_curriculum_run(run):
+    t = Timeline(run)
+    assert t.is_curriculum is False
+    assert t.stages == [] and t.order == []
+    assert t.stage_at(0) is None
+
+
+def test_stages_are_read_back(curriculum_run):
+    t = Timeline(curriculum_run)
+    assert t.is_curriculum is True
+    assert [s.index for s in t.stages] == [0, 1, 2]
+    assert t.order == [4, 0, 7, 2, 5]
+    assert t.stage_steps.tolist() == [100, 200], "boundaries, stage 0 excluded"
+
+
+def test_stage_at_is_the_stage_in_force(curriculum_run):
+    t = Timeline(curriculum_run)
+    assert t.stage_at(0).index == 0
+    assert t.stage_at(99).index == 0
+    assert t.stage_at(100).index == 1
+    assert t.stage_at(10**6).index == 2
+
+
+def test_stage_gain_is_the_improvement_on_its_own_view(curriculum_run):
+    t = Timeline(curriculum_run)
+    assert t.stages[1].gain == pytest.approx(4.5)
+    assert t.stages[0].gain is None, "stage 0 adds no image, so there is no view"
+
+
+def test_incremental_roles_come_from_the_order_and_the_count(curriculum_run):
+    """So the viewer can colour a frustum without the trainer's live state."""
+    t = Timeline(curriculum_run)
+    r = t.active_images(0)
+    assert (r.active, r.resting, r.pending, r.added) == ([4, 0, 7], [], [2, 5], None)
+    r = t.active_images(100)
+    assert (r.active, r.resting, r.pending, r.added) == ([4, 0, 7, 2], [], [5], 2)
+    r = t.active_images(250)
+    assert (r.active, r.resting, r.pending, r.added) == ([4, 0, 7, 2, 5], [], [], 5)
+    assert not r.resting, "nothing rests in incremental mode: everything seen is active"
+
+
+def test_groups_mode_separates_active_from_resting(tmp_path):
+    """The distinction the mode exists for: seen and seeded, but not currently
+    receiving gradient. Inferring it from the image count would be wrong,
+    because the active set is one group and not a prefix of the order."""
+    import json
+
+    paths = RunPaths(tmp_path).mkdirs()
+    SnapshotWriter(paths.snapshots, every=1).save(0, make_splats(3), None)
+    (paths.root / "stages.json").write_text(json.dumps({
+        "mode": "groups",
+        "order": [4, 0, 7, 2, 5, 9],
+        "stages": [
+            {"stage": 0, "step": 0, "end_step": 50, "added": 4, "image": "a.jpeg",
+             "n_images": 3, "active": [4, 0, 7], "n_active": 3, "group": 0, "round": 0},
+            {"stage": 1, "step": 50, "end_step": 100, "added": 2, "image": "b.jpeg",
+             "n_images": 6, "active": [2, 5, 9], "n_active": 3, "group": 1, "round": 0},
+            {"stage": 2, "step": 100, "end_step": 150, "added": None, "image": None,
+             "n_images": 6, "active": [4, 0, 7], "n_active": 3, "group": 0, "round": 1},
+        ],
+    }))
+    t = Timeline(paths)
+    r = t.active_images(50)
+    assert r.active == [2, 5, 9]
+    assert r.resting == [4, 0, 7], "seen in round 0, waiting their turn"
+    assert r.pending == []
+    r = t.active_images(100)
+    assert r.active == [4, 0, 7] and r.resting == [2, 5, 9]
+    assert r.added is None, "a revisit introduces nothing, so no blind guess"
+
+
+def test_deltas_are_loaded_and_cached(curriculum_run):
+    t = Timeline(curriculum_run)
+    d = t.deltas(1)
+    assert d is not None and d["ids"].tolist() == [3, 0, 8]
+    assert t.deltas(1) is d, "cached, not re-read per frame"
+    assert t.deltas(2) is None, "stage 2 recorded no delta file"
+
+
+def test_narration_names_the_stage_and_what_it_taught(curriculum_run):
+    t = Timeline(curriculum_run)
+    text = t.narrate(100, t.frame(100)["ids"])
+    assert "stage 1: 4 images" in text
+    assert "just added IMG_0002.jpeg" in text
+    assert "1 photos still pending" in text
+    assert "9 Gaussians seeded" in text
+    assert "10.00 dB blind -> 14.50 dB (+4.50)" in text
+
+
+def test_a_truncated_stages_file_does_not_stop_the_viewer(run):
+    """A run killed mid-write. Losing the markers is survivable."""
+    (run.root / "stages.json").write_text('{"stages": [{"stage": 0,')
+    t = Timeline(run)
+    assert t.is_curriculum is False
+    assert t.steps == [0, 100, 200, 300], "the timeline still scrubs"
+
+
+def test_stage_markers_fall_back_to_the_event_log(run):
+    """stages.json can be missing while the event log still has the boundaries."""
+    from splat.events import EventLog
+
+    log = synthetic_log()
+    log.add_stage(100, image=7)
+    log.add_stage(200, image=9)
+    log.flush(run.events)
+    t = Timeline(run)
+    assert not t.is_curriculum
+    assert t.stage_steps.tolist() == [100, 200]
+
+
+# -- colour by what a stage changed ---------------------------------------
+
+
+def test_delta_colours_only_touch_the_survivors():
+    """"born during this stage" and "did not move" are different statements."""
+    from splat.timeline import colors_by_delta
+
+    deltas = {
+        "ids": np.array([5, 9], dtype=np.int32),
+        "d_means": np.array([0.0, 1.0], dtype=np.float16),
+    }
+    rgb = colors_by_delta(np.array([9, 77, 5]), deltas)
+    assert rgb.shape == (3, 3) and rgb.dtype == np.float32
+    unchanged = np.array([0.15, 0.16, 0.18], dtype=np.float32)
+    np.testing.assert_allclose(rgb[1], unchanged, atol=1e-6), "77 was not alive at both ends"
+    assert not np.allclose(rgb[0], unchanged), "9 moved the most"
+    assert not np.allclose(rgb[0], rgb[2]), "and 5 did not move at all"
+
+
+def test_delta_colours_are_robust_to_one_flier():
+    """The reason the scale is a percentile and not the maximum: there is always
+    one Gaussian that flew across the room, and against `max` it would compress
+    every real change into the first fraction of a percent of the ramp."""
+    from splat.timeline import colors_by_delta
+
+    n = 1000
+    ids = np.arange(n, dtype=np.int32)
+    values = np.full(n, 0.5, dtype=np.float16)
+    values[0] = 1000.0  # the flier
+    rgb = colors_by_delta(ids, {"ids": ids, "d_means": values})
+
+    from matplotlib import colormaps
+
+    top = np.asarray(colormaps["inferno"](1.0)[:3], dtype=np.float32)
+    # where max-scaling would have put the bulk: 0.5 / 1000 along the ramp
+    under_max_scaling = np.asarray(colormaps["inferno"](0.0005)[:3], dtype=np.float32)
+
+    bulk = rgb[1]
+    np.testing.assert_allclose(bulk, top, atol=1e-5)
+    assert np.linalg.norm(bulk - under_max_scaling) > 0.5, "not squashed to the floor"
+    np.testing.assert_allclose(rgb[0], top, atol=1e-5), "the flier clips, it does not rescale"
+
+
+def test_delta_colours_survive_an_empty_record():
+    from splat.timeline import colors_by_delta
+
+    rgb = colors_by_delta(np.array([1, 2]), {"ids": np.empty(0, np.int32)})
+    assert rgb.shape == (2, 3)
+    rgb = colors_by_delta(np.array([1, 2]), {"ids": np.array([1]), "d_means": None})
+    assert rgb.shape == (2, 3)

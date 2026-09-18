@@ -57,6 +57,14 @@ def check(run: RunPaths) -> int:
         if tline.lineage else "  (no --lineage, so no origin/age/lineage modes)"
     ))
     print(f"config:    {'yes' if tline.cfg else 'no'}")
+    if tline.is_curriculum:
+        gains = [s.gain for s in tline.stages if s.gain is not None]
+        deltas = sum(1 for s in tline.stages if s.deltas)
+        print(
+            f"curriculum {len(tline.stages)} stages over {len(tline.order)} images,"
+            f" {deltas} with per-Gaussian deltas"
+            + (f", mean +{sum(gains)/len(gains):.2f} dB per photo" if gains else "")
+        )
     print(f"schedule:  {tline.schedule}")
     if steps:
         print()

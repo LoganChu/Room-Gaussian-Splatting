@@ -18,6 +18,7 @@ from splat.timeline import Timeline
 torch = pytest.importorskip("torch")
 
 from splat.snapshots import SnapshotWriter  # noqa: E402
+from splat.report import psnr  # noqa: E402
 from splat.viewer import (  # noqa: E402
     AGE_MODE,
     ORIGIN_MODE,
@@ -25,7 +26,6 @@ from splat.viewer import (  # noqa: E402
     Cameras,
     Playback,
     error_triptych,
-    psnr,
 )
 
 CPU = torch.device("cpu")
@@ -185,5 +185,15 @@ def test_cameras_are_optional(tmp_path):
 
 
 def test_every_role_has_a_frustum_colour():
-    assert set(ROLE_COLORS) == {"train", "test", "pending", "added"}
+    assert set(ROLE_COLORS) == {"train", "test", "pending", "added", "resting"}
     assert all(len(v) == 3 for v in ROLE_COLORS.values())
+
+
+def test_resting_reads_as_a_dimmer_active_not_as_pending():
+    """"seen and seeded" is much closer to active than to never-seen, so it
+    shares active's hue rather than pending's grey."""
+    resting = np.array(ROLE_COLORS["resting"], dtype=float)
+    active = np.array(ROLE_COLORS["train"], dtype=float)
+    pending = np.array(ROLE_COLORS["pending"], dtype=float)
+    assert resting.sum() < active.sum(), "dimmer"
+    assert np.linalg.norm(resting - active) < np.linalg.norm(resting - pending)
