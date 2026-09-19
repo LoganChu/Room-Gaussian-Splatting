@@ -58,6 +58,27 @@ construction, so a difference between groups is a difference between the images.
 The cost is that only one group is training at a time, so the schedule needs
 enough rounds to avoid ending fitted to whichever group went last.
 
+Handing over before densification stops
+---------------------------------------
+gsplat grows the population (clone and split) only between ``refine_start_iter``
+and ``refine_stop_iter`` -- 500 and 15,000 by default -- whatever else the run
+is doing. Both modes used to stretch their schedule over all of ``max_steps``,
+and at 30k steps that broke them. Measured on ``room-1`` at factor 2:
+
+- **incremental** introduced its last 8 photos after step 15,000. The population
+  went from 2,686,289 to 2,686,712 over those 14,500 steps: the photos arrived
+  with nothing left to build what they showed. Held-out PSNR 14.26 against
+  18.84 for a plain run.
+- **groups** never trained on more than 4 images at once, so the model ended
+  fitted to whichever group went last, swinging 14.4-15.2 dB between visits.
+  Held-out 14.77.
+
+So ``end_step`` compresses the schedule into ``[0, end_step)`` and a final
+*consolidation* stage trains on every image together until ``max_steps``. The
+trainer defaults it to 80% of ``refine_stop_iter``, which leaves the last photo
+the final fifth of densification. Short runs (``end_step >= max_steps``) and
+the ablation's fixed-N runs (no stages to schedule) are unchanged.
+
 Two sets, kept apart
 --------------------
 ``Stage.active`` is what the sampler may draw from *now*; ``Stage.seen`` is
@@ -226,6 +247,9 @@ class Stage:
     length: int = 0  #: steps in this stage, 0 for the last (it runs to max_steps)
     group: Optional[int] = None  #: which group, in groups mode
     round: Optional[int] = None  #: which round-robin pass, in groups mode
+    #: the closing stage after ``end_step``: every image seen, all of them
+    #: training together, nothing new introduced
+    consolidate: bool = False
 
     def __post_init__(self) -> None:
         if not self.seen:
@@ -287,6 +311,13 @@ class CurriculumConfig:
     #: fitted to whichever group went last.
     rounds: int = 4
 
+    # -- both modes --------------------------------------------------------
+    #: step by which the schedule has introduced every image; from here to
+    #: ``max_steps`` one consolidation stage trains on all of them together.
+    #: 0 (or anything >= max_steps) lets the schedule fill the whole run.
+    #: See "Handing over before densification stops" in the module docstring.
+    end_step: int = 0
+
 
 class Curriculum:
     """The schedule, and what each stage unlocks.
@@ -305,6 +336,9 @@ class Curriculum:
         self.covis = covis
         self.cfg = cfg or CurriculumConfig()
         self.max_steps = int(max_steps)
+        #: the steps the image schedule itself may use; the rest is consolidation
+        end = int(self.cfg.end_step)
+        self.budget = end if 0 < end < self.max_steps else self.max_steps
         #: the full ordering. ``max_images`` truncates the *schedule*, not this,
         #: so an ablation condition still uses the same ordering as the full run
         #: -- N=5 is the first five images a full run would have used, which is
@@ -330,10 +364,32 @@ class Curriculum:
                 )
             order = order[: cfg.max_images]
         if cfg.mode == "groups":
-            return self._schedule_groups(order)
-        if cfg.mode != "incremental":
+            stages = self._schedule_groups(order)
+        elif cfg.mode == "incremental":
+            stages = self._schedule_incremental(order)
+        else:
             raise ValueError(f"unknown curriculum mode {cfg.mode!r}")
-        return self._schedule_incremental(order)
+        if self.budget < self.max_steps and len(stages) > 1:
+            stages.append(self._consolidation(stages))
+        return stages
+
+    def _consolidation(self, stages: List[Stage]) -> Stage:
+        """Every image seen, all training together, until ``max_steps``.
+
+        Starts where the schedule actually ended rather than at ``budget``:
+        integer stage lengths leave a remainder of a few steps either way.
+        """
+        last = stages[-1]
+        step = last.step + last.length
+        return Stage(
+            index=len(stages),
+            step=step,
+            added=None,
+            active=last.seen,
+            seen=last.seen,
+            length=max(0, self.max_steps - step),
+            consolidate=True,
+        )
 
     def _schedule_incremental(self, order: List[int]) -> List[Stage]:
         """Images accumulate one at a time.
@@ -388,7 +444,7 @@ class Curriculum:
         and no flag has to be tuned by hand. At least 1, so a debug run still
         visits every stage instead of silently dropping the tail.
         """
-        budget = max(1, self.max_steps - warmup)
+        budget = max(1, self.budget - warmup)
         return max(1.0, budget / max(1, sum(counts)))
 
     def _schedule_groups(self, order: List[int]) -> List[Stage]:
@@ -443,12 +499,12 @@ class Curriculum:
         return stages
 
     def _group_visit_steps(self, groups: List[Tuple[int, ...]], rounds: int) -> float:
-        """Steps per full-size group visit, so the rounds fill ``max_steps``."""
+        """Steps per full-size group visit, so the rounds fill the budget."""
         cfg = self.cfg
         if cfg.steps_per_image:
             return float(cfg.steps_per_image * max(1, int(cfg.group_size)))
         total_members = sum(len(g) for g in groups)
-        return max(1.0, self.max_steps / max(1, rounds * total_members)) * max(
+        return max(1.0, self.budget / max(1, rounds * total_members)) * max(
             1, int(cfg.group_size)
         )
 
@@ -545,6 +601,7 @@ class Curriculum:
                     "steps_per_active_image": round(stage.steps_per_active_image, 2),
                     "group": stage.group,
                     "round": stage.round,
+                    "consolidate": stage.consolidate,
                     "n_points_unlocked": int(mask.sum()),
                 }
             )

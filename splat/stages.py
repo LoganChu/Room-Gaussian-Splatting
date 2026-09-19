@@ -106,6 +106,8 @@ class StageRecord:
     group: Optional[int] = None
     round: Optional[int] = None
     group_images: Optional[List[str]] = None
+    #: the closing all-images stage after the curriculum's ``end_step``
+    consolidate: bool = False
     #: item indices the sampler drew from. Needed by the viewer: in groups mode
     #: the active set is one group, not a prefix of the curriculum order, so it
     #: cannot be reconstructed from the image count alone.
@@ -253,6 +255,7 @@ class StageDriver:
             steps_per_active_image=round(stage.steps_per_active_image, 3),
             group=stage.group,
             round=stage.round,
+            consolidate=stage.consolidate,
             group_images=(
                 None if stage.group is None
                 else [self.image_name(i) or "?" for i in stage.active]

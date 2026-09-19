@@ -130,6 +130,7 @@ class StageInfo:
     steps_per_active_image: float = 0.0
     group: Optional[int] = None
     round: Optional[int] = None
+    consolidate: bool = False  #: all images training together, after the schedule
     n_seeded: int = 0
     n_survived: int = 0
     n_born: int = 0
@@ -152,6 +153,7 @@ class StageInfo:
             steps_per_active_image=float(rec.get("steps_per_active_image", 0) or 0),
             group=rec.get("group"),
             round=rec.get("round"),
+            consolidate=bool(rec.get("consolidate", False)),
             n_seeded=int(rec.get("n_seeded", 0) or 0),
             n_survived=int(rec.get("n_survived", 0) or 0),
             n_born=int(rec.get("n_born", 0) or 0),
@@ -600,6 +602,8 @@ class Timeline:
         if stage is not None:
             roles = self.active_images(step)
             head = f"stage {stage.index}: {stage.n_images} images seen"
+            if stage.consolidate:
+                head += ", consolidation: all of them training together"
             if stage.group is not None:
                 head += f", training group {stage.group} (round {stage.round})"
             if stage.image:

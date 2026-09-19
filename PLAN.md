@@ -620,6 +620,47 @@ than assuming uniform sampling made it uniform — it does not, because the pool
   for the *fixed-budget* question ("how should I spend N steps"), and that is a different question —
   worth running only if it is one you have.
 
+**Revision 2 — at 30k steps both modes collided with gsplat's densification window (2026-09-18).**
+
+All runs: `room-1`, `--data_factor 2`, 30k steps, n = 1 each.
+
+| run | PSNR 7k | PSNR 30k | Gaussians | time |
+|---|---|---|---|---|
+| `baseline-room1-30k` (plain) | 18.95 | **18.84** | 4.49M | 19.6 min |
+| `curriculum-incremental-30k` | 11.13 | 14.26 | 2.69M | 16.6 min |
+| `curriculum-groups-30k` | 11.48 | 14.77 | 1.33M | 14.2 min |
+| `curriculum-incremental-30k-consolidated` | 16.01 | **16.88** | 4.16M | 19.6 min |
+| `curriculum-groups-30k-consolidated` | 15.55 | **16.21** | 2.55M | 15.3 min |
+
+- **Why the first pair failed.** Clone/split only happen in `[500, 15000)`. Incremental introduced its
+  last 8 photos after 15k — the population went 2,686,289 → 2,686,712 over those 14,500 steps.
+  Groups never trained on more than 4 images at once and ended fitted to whichever group went last.
+  The 4k dev runs never showed it because they end before `refine_stop_iter`; even so, plain
+  `dev-room-4k` (20.06) beat both curriculum dev runs (17.40, 17.59), which was the earlier warning.
+- **Fix: `--curriculum_end_step`** (default 80% of `refine_stop_iter` = 12,000). The schedule is
+  compressed into `[0, end_step)` and a final **consolidation** stage trains every image together to
+  `max_steps`. Short runs and the ablation's fixed-N runs are unchanged. 10 tests (272 total).
+- **It recovered +2.6 dB (incremental) and +1.4 dB (groups), and leaves a ~2 dB gap to plain.**
+  Incremental peaked at 17.17 at step 10,409 and drifted to 16.88 — the same late-drift the plain run
+  shows (18.95 → 18.84). The remaining gap is plausibly the start: 1,492 of 6,762 SfM points and
+  three images for the first 500 steps, so early densification is spent fitting a corner. Not tested.
+- **Groups' 8.93 dB at step 12,011 is the reset dip** (reset at 12,000), not a regression; the report
+  rings it.
+- **Conclusion.** The curriculum is the *narrative* — it shows the step-by-step story — not a better
+  way to train. For the final room model use the plain run.
+
+**Ablation, run for real (`ablate-room-1`, factor 2, 7k steps, n = 1).**
+
+| N | 3 | 5 | 10 | 20 | 28 |
+|---|---|---|---|---|---|
+| held-out PSNR | 7.56 | 6.98 | 14.65 | 16.11 | 17.71 |
+
+3 and 5 photos fail outright on the held-out views; 5 → 10 (+7.7 dB) is far outside noise; 20 → 28
+(+1.6 dB) is still climbing but below what n = 1 can resolve. With the plain run flat after 7k, the
+direction is consistent: **this room is photo-limited.** ⚠️ N=28 at 17.71 is *not* comparable to the
+baseline's 18.95 at 7k: the means LR decays to 1% over `max_steps`, so a 7k-long run and the 7k point of
+a 30k run are on different schedules.
+
 **Phase 6 — Your room at full quality on the 5090**
 - **Train:** run the full-resolution incremental run followed by a standard 30k run.
 - **Output:** export the PLY (viewable in SuperSplat) and do the browser walkthrough.
@@ -636,7 +677,7 @@ Everything now runs on one machine: the native Ubuntu 5090 desktop. The WSL2 / W
 | 2 capture + SfM | ✅ done | `data/scenes/room-1/`, 32/32 registered, 0.93 px |
 | 3 instrumentation | ✅ done | lineage/events/snapshots/report + hooks 1 & 4; neutrality established |
 | 4 playback viewer | ✅ done | `timeline.py`/`viewer.py`/`view.py`; verified on `dev-room-4k`, 108 tests |
-| 5 curriculum | ✅ done | two modes: incremental (narrative) + groups (fair exposure); 262 tests |
+| 5 curriculum | ✅ done | two modes + consolidation stage; ablation run; 272 tests. Plain run beats both by ~2 dB |
 | 6 full-quality room run | todo | `--data_factor 1` or 2; the payoff |
 
 **Immediate plan:**

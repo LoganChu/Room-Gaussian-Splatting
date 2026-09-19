@@ -217,6 +217,11 @@ class Config:
     curriculum_warmup: int = 500
     # [splat] steps per added image; 0 divides what is left of max_steps evenly
     curriculum_stage_steps: int = 0
+    # [splat] step by which every image has been introduced; after it, one
+    # consolidation stage trains on all of them until max_steps. -1 derives it
+    # as 80% of the strategy's refine_stop_iter, so the last photo still gets
+    # densification; 0 lets the schedule fill the whole run (the old behaviour).
+    curriculum_end_step: int = -1
     # [splat] a seed must be this many multiples of the SfM cloud's typical
     # point spacing from every existing Gaussian; 0 disables the check
     curriculum_min_spacing: float = 1.0
@@ -541,6 +546,10 @@ class Runner:
             if not cfg.lineage:
                 raise ValueError("--curriculum requires --lineage: seed provenance is the point")
             covis = Covisibility.from_parser(self.parser, self.trainset.indices)
+            end_step = cfg.curriculum_end_step
+            if end_step < 0:
+                stop = getattr(cfg.strategy, "refine_stop_iter", 0)
+                end_step = int(0.8 * stop) if stop else 0
             self.curriculum = Curriculum(
                 covis,
                 max_steps=cfg.max_steps,
@@ -553,6 +562,7 @@ class Runner:
                     rounds=cfg.curriculum_rounds,
                     warmup_steps=cfg.curriculum_warmup,
                     stage_steps=cfg.curriculum_stage_steps,
+                    end_step=end_step,
                     min_spacing=cfg.curriculum_min_spacing,
                     max_seeds_per_stage=cfg.curriculum_max_seeds,
                 ),

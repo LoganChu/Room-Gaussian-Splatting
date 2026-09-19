@@ -307,6 +307,11 @@ def plot_curriculum(run: RunPaths, out_dir: Path, title: str = "") -> Optional[P
     # --- test PSNR. In groups mode every round revisits all the images, so the
     # image count stops being an x axis after round 0 and the step is.
     have = [r for r in rows if r.get("test_psnr") is not None]
+    # The consolidation stage adds no image, so on an image-count axis it would
+    # sit on top of the last stage and read as a vertical jump. It is drawn as
+    # its own marker instead, and kept off the curve.
+    closing = [r for r in have if r.get("consolidate")]
+    have = [r for r in have if not r.get("consolidate")]
     if have:
         by_step = mode == "groups"
         xs = [r["step"] if by_step else r["n_images"] for r in have]
@@ -323,6 +328,14 @@ def plot_curriculum(run: RunPaths, out_dir: Path, title: str = "") -> Optional[P
                 s=120, facecolors="none", edgecolors="#E03131", lw=1.8, zorder=5,
                 label=f"within {RESET_SHADOW_STEPS} steps of an opacity reset",
             )
+        for r in closing:
+            x = r["end_step"] if by_step and r.get("end_step") is not None else (
+                r["step"] if by_step else r["n_images"])
+            ax.plot([x], [r["test_psnr"]], "*", color="#1971C2", ms=16, zorder=6,
+                    label=f"after consolidation (all {r['n_images']} images from"
+                          f" step {r['step']:,})")
+            if by_step:
+                ax.axvspan(r["step"], x, color="#1971C2", alpha=0.06, zorder=0)
         ax.set_ylabel("held-out PSNR (dB)", color="#1971C2")
         ax.tick_params(axis="y", colors="#1971C2")
         gx = ax.twinx()

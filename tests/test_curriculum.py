@@ -450,3 +450,80 @@ def test_exposure_covers_every_image_the_run_sees(covis):
     cur = Curriculum(covis, max_steps=1000)
     assert set(cur.exposure()) >= set(cur.images)
     assert all(v > 0 for k, v in cur.exposure().items() if k in set(cur.images))
+
+
+# -- end_step: hand over to all-images training ------------------------------
+
+
+def test_end_step_compresses_the_incremental_schedule(covis):
+    """Same proportional pacing, fitted into 600 steps instead of 1000:
+    e = (600-100)/15, so the image stages are 133, 166, 200 and the schedule
+    ends at 599 -- the integer remainder is the consolidation stage's."""
+    cur = Curriculum(covis, max_steps=1000,
+                     cfg=CurriculumConfig(warmup_steps=100, end_step=600))
+    assert [s.added for s in cur.stages] == [None, 3, 4, 5, None]
+    assert [s.length for s in cur.stages[:4]] == [100, 133, 166, 200]
+    closing = cur.stages[-1]
+    assert closing.consolidate and not any(s.consolidate for s in cur.stages[:-1])
+    assert closing.step == 599 and closing.step + closing.length == 1000
+
+
+def test_consolidation_trains_every_image_seen(covis):
+    cur = Curriculum(covis, max_steps=1000,
+                     cfg=CurriculumConfig(warmup_steps=100, end_step=600))
+    closing = cur.stages[-1]
+    assert sorted(closing.active) == sorted(cur.images) == list(range(6))
+    assert closing.seen == cur.stages[-2].seen
+    assert closing.added is None, "it introduces nothing, so there is no blind guess"
+    assert not cur.seed_mask(closing).any(), "and unlocks no points"
+
+
+def test_end_step_compresses_the_groups_schedule(covis):
+    cur = Curriculum(covis, max_steps=1200, cfg=CurriculumConfig(
+        mode="groups", group_size=3, rounds=2, end_step=600))
+    rounds = [s for s in cur.stages if not s.consolidate]
+    assert sum(s.length for s in rounds) == 600
+    closing = cur.stages[-1]
+    assert closing.consolidate and closing.group is None and closing.round is None
+    assert sorted(closing.active) == list(range(6))
+    assert closing.step == 600 and closing.length == 600
+
+
+def test_consolidation_keeps_groups_exposure_equal(covis):
+    """Every image gets an equal share of the consolidation stage too, so the
+    mode's one guarantee survives it."""
+    cur = Curriculum(covis, max_steps=1200, cfg=CurriculumConfig(
+        mode="groups", group_size=3, rounds=2, end_step=600))
+    assert cur.exposure_spread() == pytest.approx(1.0)
+    assert sum(cur.exposure().values()) == pytest.approx(1200)
+
+
+def test_consolidation_shrinks_the_incremental_exposure_spread(covis):
+    base = Curriculum(covis, max_steps=1000, cfg=CurriculumConfig(warmup_steps=100))
+    handed = Curriculum(covis, max_steps=1000,
+                        cfg=CurriculumConfig(warmup_steps=100, end_step=600))
+    assert handed.exposure_spread() < base.exposure_spread()
+
+
+@pytest.mark.parametrize("end", [0, 1000, 5000])
+def test_an_end_step_at_or_past_max_steps_changes_nothing(covis, end):
+    """Short dev runs (end_step 12000, max_steps 4000) keep their old schedule."""
+    base = Curriculum(covis, max_steps=1000, cfg=CurriculumConfig(warmup_steps=100))
+    cur = Curriculum(covis, max_steps=1000,
+                     cfg=CurriculumConfig(warmup_steps=100, end_step=end))
+    assert cur.stages == base.stages
+
+
+def test_a_fixed_image_run_gets_no_consolidation_stage(covis):
+    """The ablation's condition: no images are added, so there is no schedule
+    to hand over from and the one stage still runs to max_steps."""
+    cur = Curriculum(covis, max_steps=1000,
+                     cfg=CurriculumConfig(init_images=3, max_images=3, end_step=600))
+    assert len(cur.stages) == 1
+    assert cur.stages[0].length == 1000 and not cur.stages[0].consolidate
+
+
+def test_summary_marks_the_consolidation_stage(covis):
+    cur = Curriculum(covis, max_steps=1000,
+                     cfg=CurriculumConfig(warmup_steps=100, end_step=600))
+    assert [r["consolidate"] for r in cur.summary()] == [False] * 4 + [True]
