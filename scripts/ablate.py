@@ -82,6 +82,7 @@ def run_one(
         "--eval_steps", str(max_steps),
         "--save_steps", str(max_steps),
         "--ply_steps", str(max_steps),
+        "--save_ply",  # ply_steps alone writes nothing; the trainer gates on this
         "--lineage",
         "--curriculum",
         "--curriculum_init_images", str(n_images),
